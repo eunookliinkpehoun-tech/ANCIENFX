@@ -1,164 +1,266 @@
 """
-ANCIENFX - MT5 Bridge
-=====================
-Serveur Flask léger qui expose une API HTTP locale.
-Tourne sur le VPS Windows. Next.js l'appelle via MT5_BRIDGE_URL.
+ANCIENFX - MT5 Bridge (MANAGER multi-terminal)
+==============================================
+Ce serveur est le point d'entrée unique appelé par Next.js (MT5_BRIDGE_URL).
+Il NE parle PAS directement à MetaTrader5.
 
-Principe clé :
-  - mt5.initialize()  →  s'attache au terminal MT5 déjà ouvert (aucun chemin hardcodé)
-  - mt5.login(login, password, server)  →  connexion broker par identifiants
-  - Résolution automatique des suffixes de symboles (EURUSDm → EURUSD, etc.)
+Architecture (connexion SIMULTANÉE de N comptes) :
+
+    Next.js ──HTTP──▶  bridge.py (MANAGER, port 8765)
+                          │  spawn / proxy / kill
+              ┌───────────┼─────────────┐
+              ▼           ▼             ▼
+        worker.py    worker.py     worker.py     ...  (jusqu'à 20+)
+        login A      login B       login C
+        terminal A   terminal B    terminal C    (instances portables séparées)
+        port 9101    port 9102     port 9103
+
+  → Chaque compte a SON processus + SON terminal MT5 → tous connectés en même temps.
+  → Le manager garde le même contrat HTTP qu'avant : service.ts ne change quasiment pas.
+
+Routes exposées (identiques à l'ancienne version) :
+  POST /connect        {login, password, server}
+  POST /sync           {login, server}
+  POST /disconnect     {login, server}
+  POST /positions      {login, server}
+  POST /history        {login, server, days}
+  POST /symbol_info    {login, server, symbol}
+  GET  /health
+  GET  /accounts       (bonus : liste tous les comptes connectés)
 
 Démarrer : python bridge.py
 """
 
 import os
 import sys
-import threading
 import time
+import socket
 import logging
+import threading
+import subprocess
 from datetime import datetime, timezone
 from typing import Optional
 
+import requests
 from flask import Flask, jsonify, request
 
-# ── MetaTrader5 est disponible uniquement sur Windows ──────────────────────────
+import provision
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+BRIDGE_PORT    = int(os.environ.get("BRIDGE_PORT", 8765))
+BRIDGE_SECRET  = os.environ.get("BRIDGE_SECRET", "")
+WORKER_PORT_BASE = int(os.environ.get("WORKER_PORT_BASE", 9101))
+MAX_WORKERS    = int(os.environ.get("MAX_WORKERS", 40))
+WORKER_BOOT_TIMEOUT = int(os.environ.get("WORKER_BOOT_TIMEOUT", 45))  # sec
+PYTHON_EXE     = os.environ.get("PYTHON_EXE", sys.executable)
+
 try:
-    import MetaTrader5 as mt5
+    import MetaTrader5  # noqa: F401
     MT5_AVAILABLE = True
 except ImportError:
     MT5_AVAILABLE = False
-    print("[bridge] AVERTISSEMENT: MetaTrader5 non trouvé. Mode stub activé.")
-
-# ── Configuration ──────────────────────────────────────────────────────────────
-BRIDGE_PORT     = int(os.environ.get("BRIDGE_PORT", 8765))
-BRIDGE_SECRET   = os.environ.get("BRIDGE_SECRET", "")   # optionnel, header X-Bridge-Secret
-SYNC_INTERVAL   = int(os.environ.get("SYNC_INTERVAL", 30))  # secondes entre syncs auto
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [manager] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("mt5-bridge")
+log = logging.getLogger("mt5-manager")
 
 app = Flask(__name__)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_WORKER_SCRIPT = os.path.join(_HERE, "worker.py")
 
-# ── État global des sessions ───────────────────────────────────────────────────
-# { "login|server": { login, password, server, account_info, last_sync } }
-_sessions: dict[str, dict] = {}
+# ── Registre des workers ─────────────────────────────────────────────────────────
+# key -> { proc, port, login, server, started_at }
+_workers: dict[str, dict] = {}
 _lock = threading.Lock()
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _session_key(login: str, server: str) -> str:
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def _key(login: str, server: str) -> str:
     return f"{login}|{server}"
 
 
 def _check_secret() -> Optional[tuple]:
-    """Vérifie le header X-Bridge-Secret si BRIDGE_SECRET est défini."""
+    if BRIDGE_SECRET and request.headers.get("X-Bridge-Secret", "") != BRIDGE_SECRET:
+        return jsonify({"ok": False, "message": "Non autorisé."}), 401
+    return None
+
+
+def _worker_headers() -> dict:
+    return {"X-Bridge-Secret": BRIDGE_SECRET} if BRIDGE_SECRET else {}
+
+
+def _free_port() -> int:
+    """Trouve un port libre pour un nouveau worker."""
+    used = {w["port"] for w in _workers.values()}
+    for offset in range(MAX_WORKERS):
+        port = WORKER_PORT_BASE + offset
+        if port in used:
+            continue
+        # Vérifie que le port est réellement libre sur la machine
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("127.0.0.1", port)) != 0:
+                return port
+    raise RuntimeError("Aucun port libre pour un nouveau worker (MAX_WORKERS atteint).")
+
+
+def _worker_url(port: int, path: str) -> str:
+    return f"http://127.0.0.1:{port}{path}"
+
+
+def _worker_get(port: int, path: str, timeout: float = 8.0) -> requests.Response:
+    return requests.get(_worker_url(port, path), headers=_worker_headers(), timeout=timeout)
+
+
+def _worker_post(port: int, path: str, body: dict, timeout: float = 10.0) -> requests.Response:
+    return requests.post(_worker_url(port, path), json=body, headers=_worker_headers(), timeout=timeout)
+
+
+def _wait_worker_ready(port: int, timeout: int) -> tuple[bool, str]:
+    """Attend que le worker soit démarré ET connecté (logged=True)."""
+    deadline = time.time() + timeout
+    last_err = "Le worker n'a pas répondu à temps."
+    while time.time() < deadline:
+        try:
+            res = _worker_get(port, "/health", timeout=3.0)
+            if res.ok:
+                data = res.json()
+                if data.get("logged"):
+                    return True, ""
+                if data.get("last_error"):
+                    last_err = data["last_error"]
+        except Exception:
+            pass
+        time.sleep(1.0)
+    return False, last_err
+
+
+def _spawn_worker(login: str, password: str, server: str) -> tuple[bool, str, Optional[int]]:
+    """Provisionne l'instance terminal + lance le worker. Retourne (ok, err, port)."""
+    # 1) Instance portable dédiée du terminal
+    try:
+        terminal_path = provision.ensure_instance(login)
+    except Exception as exc:
+        return False, f"Provisioning échoué: {exc}", None
+
+    # 2) Port libre
+    try:
+        port = _free_port()
+    except RuntimeError as exc:
+        return False, str(exc), None
+
+    # 3) Lancement du sous-processus worker
+    cmd = [
+        PYTHON_EXE, _WORKER_SCRIPT,
+        "--login", str(login),
+        "--password", password,
+        "--server", server,
+        "--terminal", terminal_path,
+        "--port", str(port),
+    ]
     if BRIDGE_SECRET:
-        sent = request.headers.get("X-Bridge-Secret", "")
-        if sent != BRIDGE_SECRET:
-            return jsonify({"ok": False, "message": "Non autorisé."}), 401
-    return None
+        cmd += ["--secret", BRIDGE_SECRET]
 
+    log.info("Lancement worker %s@%s sur port %d", login, server, port)
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=_HERE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        return False, f"Impossible de lancer le worker: {exc}", None
 
-def _ensure_mt5() -> bool:
-    """S'assure que MT5 est initialisé (attaché au terminal ouvert)."""
-    if not MT5_AVAILABLE:
-        return False
-    if mt5.terminal_info() is not None:
-        return True
-    # S'attache au terminal déjà ouvert — aucun chemin passé
-    if not mt5.initialize():
-        log.error("mt5.initialize() a échoué: %s", mt5.last_error())
-        return False
-    log.info("mt5.initialize() OK — terminal attaché")
-    return True
+    with _lock:
+        _workers[_key(login, server)] = {
+            "proc": proc,
+            "port": port,
+            "login": login,
+            "server": server,
+            "started_at": time.time(),
+        }
 
-
-def _login_account(login: str, password: str, server: str) -> tuple[bool, str]:
-    """Tente mt5.login(). Retourne (ok, message_erreur)."""
-    if not _ensure_mt5():
-        return False, "Impossible d'attacher le terminal MT5. Vérifiez qu'il est ouvert."
-    ok = mt5.login(int(login), password=password, server=server)
+    # 4) Attente de connexion
+    ok, err = _wait_worker_ready(port, WORKER_BOOT_TIMEOUT)
     if not ok:
-        code, msg = mt5.last_error()
-        return False, f"Connexion échouée (code {code}): {msg}"
-    return True, ""
+        log.warning("Worker %s non prêt: %s", login, err)
+        _kill_worker(login, server)
+        return False, err, None
+
+    return True, "", port
 
 
-def _account_info_dict(login: str, server: str) -> Optional[dict]:
-    """Lit les infos du compte actuellement connecté dans MT5."""
-    if not MT5_AVAILABLE:
-        return None
-    info = mt5.account_info()
-    if info is None:
-        return None
-
-    is_demo = info.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO
-
-    return {
-        "login": str(info.login),
-        "server": server,
-        "broker": info.company,
-        "accountType": "DEMO" if is_demo else "RÉEL",
-        "leverage": info.leverage,
-        "isDemo": is_demo,
-        "balance": round(info.balance, 2),
-        "equity": round(info.equity, 2),
-        "freeMargin": round(info.margin_free, 2),
-        "dailyProfit": round(info.profit, 2),
-        "currency": info.currency,
-    }
+def _kill_worker(login: str, server: str) -> None:
+    key = _key(login, server)
+    with _lock:
+        w = _workers.pop(key, None)
+    if not w:
+        return
+    # Arrêt propre via /shutdown, puis kill si nécessaire
+    try:
+        _worker_post(w["port"], "/shutdown", {}, timeout=3.0)
+    except Exception:
+        pass
+    proc = w["proc"]
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    log.info("Worker arrêté: %s@%s", login, server)
 
 
-def _resolve_symbol(raw: str) -> Optional[str]:
-    """
-    Résolution automatique du suffixe du symbole.
-    Ex: EURUSDm → EURUSD si EURUSDm n'existe pas mais EURUSD existe.
-    """
-    if not MT5_AVAILABLE:
-        return raw
-    # Essai direct
-    info = mt5.symbol_info(raw)
-    if info is not None:
-        return raw
-    # Essai sans le suffixe (dernière lettre non numérique)
-    base = raw.rstrip("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ").rstrip(".")
-    # Essai avec les suffixes courants
-    candidates = [raw, base, raw + "m", raw + ".a", raw + ".r"]
-    for c in candidates:
-        if mt5.symbol_info(c) is not None:
-            return c
-    return None
+def _get_worker(login: str, server: str) -> Optional[dict]:
+    with _lock:
+        return _workers.get(_key(login, server))
 
 
-# ── Routes API ─────────────────────────────────────────────────────────────────
-
+# ── Routes ───────────────────────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
-    terminal_ok = False
-    terminal_info = {}
-    if MT5_AVAILABLE:
-        info = mt5.terminal_info()
-        terminal_ok = info is not None
-        if info:
-            terminal_info = {
-                "path": info.path,
-                "data_path": info.data_path,
-                "connected": info.connected,
-                "build": info.build,
-            }
+    with _lock:
+        workers_snapshot = [
+            {"login": w["login"], "server": w["server"], "port": w["port"]}
+            for w in _workers.values()
+        ]
     return jsonify({
         "ok": True,
         "mt5_available": MT5_AVAILABLE,
-        "terminal_connected": terminal_ok,
-        "terminal": terminal_info,
-        "active_sessions": len(_sessions),
+        "terminal_connected": len(workers_snapshot) > 0,
+        "active_sessions": len(workers_snapshot),
+        "workers": workers_snapshot,
+        "max_workers": MAX_WORKERS,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
+
+
+@app.route("/accounts", methods=["GET"])
+def accounts():
+    """Liste tous les comptes connectés avec leur dernier snapshot."""
+    guard = _check_secret()
+    if guard:
+        return guard
+    result = []
+    with _lock:
+        items = list(_workers.values())
+    for w in items:
+        entry = {"login": w["login"], "server": w["server"], "connected": False, "account": None}
+        try:
+            res = _worker_get(w["port"], "/health", timeout=3.0)
+            if res.ok:
+                entry["connected"] = res.json().get("logged", False)
+            acc = _worker_get(w["port"], "/account", timeout=5.0)
+            if acc.ok and acc.json().get("ok"):
+                entry["account"] = acc.json()["account"]
+        except Exception:
+            pass
+        result.append(entry)
+    return jsonify({"ok": True, "accounts": result})
 
 
 @app.route("/connect", methods=["POST"])
@@ -178,24 +280,35 @@ def connect():
     if not MT5_AVAILABLE:
         return jsonify({"ok": False, "message": "MetaTrader5 non disponible sur ce système."}), 503
 
-    ok, err = _login_account(login, password, server)
+    # Déjà connecté ? On renvoie le snapshot courant.
+    existing = _get_worker(login, server)
+    if existing:
+        try:
+            res = _worker_get(existing["port"], "/account", timeout=6.0)
+            if res.ok and res.json().get("ok"):
+                return jsonify({"ok": True, "account": res.json()["account"], "reused": True})
+        except Exception:
+            pass
+        # Worker mort/bloqué → on le remplace
+        _kill_worker(login, server)
+
+    with _lock:
+        if len(_workers) >= MAX_WORKERS:
+            return jsonify({"ok": False, "message": f"Limite de {MAX_WORKERS} comptes atteinte."}), 429
+
+    ok, err, port = _spawn_worker(login, password, server)
     if not ok:
-        log.warning("Connexion refusée pour %s@%s: %s", login, server, err)
         return jsonify({"ok": False, "message": err}), 401
 
-    account = _account_info_dict(login, server)
-    if account is None:
-        return jsonify({"ok": False, "message": "Impossible de lire les informations du compte."}), 500
-
-    key = _session_key(login, server)
-    with _lock:
-        _sessions[key] = {
-            "login": login,
-            "password": password,
-            "server": server,
-            "account": account,
-            "last_sync": time.time(),
-        }
+    try:
+        res = _worker_get(port, "/account", timeout=8.0)
+        if not res.ok or not res.json().get("ok"):
+            _kill_worker(login, server)
+            return jsonify({"ok": False, "message": "Compte connecté mais infos illisibles."}), 500
+        account = res.json()["account"]
+    except Exception as exc:
+        _kill_worker(login, server)
+        return jsonify({"ok": False, "message": f"Erreur lecture compte: {exc}"}), 500
 
     log.info("Connecté: %s@%s  balance=%.2f", login, server, account["balance"])
     return jsonify({"ok": True, "account": account})
@@ -206,55 +319,19 @@ def sync():
     guard = _check_secret()
     if guard:
         return guard
-
     data   = request.json or {}
     login  = str(data.get("login", "")).strip()
     server = str(data.get("server", "")).strip()
-    key    = _session_key(login, server)
 
-    with _lock:
-        session = _sessions.get(key)
-
-    if session is None:
+    w = _get_worker(login, server)
+    if not w:
         return jsonify({"ok": False, "message": "Session introuvable. Reconnectez le compte."}), 404
-
-    if not MT5_AVAILABLE:
-        return jsonify({"ok": False, "message": "MetaTrader5 non disponible."}), 503
-
-    # Re-login si nécessaire
-    if mt5.account_info() is None or str(mt5.account_info().login) != login:
-        ok, err = _login_account(session["login"], session["password"], session["server"])
-        if not ok:
-            return jsonify({"ok": False, "message": err}), 500
-
-    account = _account_info_dict(login, server)
-    if account is None:
-        return jsonify({"ok": False, "message": "Impossible de lire les infos du compte."}), 500
-
-    with _lock:
-        _sessions[key]["account"]   = account
-        _sessions[key]["last_sync"] = time.time()
-
-    return jsonify({"ok": True, "account": account})
-
-
-@app.route("/disconnect", methods=["POST"])
-def disconnect():
-    guard = _check_secret()
-    if guard:
-        return guard
-
-    data   = request.json or {}
-    login  = str(data.get("login", "")).strip()
-    server = str(data.get("server", "")).strip()
-    key    = _session_key(login, server)
-
-    with _lock:
-        _sessions.pop(key, None)
-
-    # On ne déconnecte pas MT5 globalement car d'autres sessions peuvent être actives
-    log.info("Session supprimée: %s@%s", login, server)
-    return jsonify({"ok": True})
+    try:
+        res = _worker_get(w["port"], "/account", timeout=8.0)
+        payload = res.json()
+        return jsonify(payload), res.status_code
+    except Exception as exc:
+        return jsonify({"ok": False, "message": f"Worker injoignable: {exc}"}), 502
 
 
 @app.route("/positions", methods=["POST"])
@@ -262,45 +339,18 @@ def positions():
     guard = _check_secret()
     if guard:
         return guard
-
     data   = request.json or {}
     login  = str(data.get("login", "")).strip()
     server = str(data.get("server", "")).strip()
-    key    = _session_key(login, server)
 
-    with _lock:
-        session = _sessions.get(key)
-
-    if session is None:
+    w = _get_worker(login, server)
+    if not w:
         return jsonify({"ok": False, "message": "Session introuvable."}), 404
-
-    if not MT5_AVAILABLE:
-        return jsonify({"ok": True, "positions": []}), 200
-
-    if mt5.account_info() is None or str(mt5.account_info().login) != login:
-        ok, err = _login_account(session["login"], session["password"], session["server"])
-        if not ok:
-            return jsonify({"ok": False, "message": err}), 500
-
-    raw_positions = mt5.positions_get()
-    result = []
-    if raw_positions:
-        for p in raw_positions:
-            result.append({
-                "ticket":    p.ticket,
-                "symbol":    p.symbol,
-                "type":      "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL",
-                "volume":    p.volume,
-                "openPrice": round(p.price_open, 5),
-                "sl":        round(p.sl, 5),
-                "tp":        round(p.tp, 5),
-                "profit":    round(p.profit, 2),
-                "swap":      round(p.swap, 2),
-                "comment":   p.comment,
-                "openTime":  datetime.fromtimestamp(p.time, tz=timezone.utc).isoformat(),
-            })
-
-    return jsonify({"ok": True, "positions": result})
+    try:
+        res = _worker_get(w["port"], "/positions", timeout=8.0)
+        return jsonify(res.json()), res.status_code
+    except Exception as exc:
+        return jsonify({"ok": False, "message": f"Worker injoignable: {exc}"}), 502
 
 
 @app.route("/history", methods=["POST"])
@@ -308,139 +358,97 @@ def history():
     guard = _check_secret()
     if guard:
         return guard
-
     data   = request.json or {}
     login  = str(data.get("login", "")).strip()
     server = str(data.get("server", "")).strip()
     days   = int(data.get("days", 30))
-    key    = _session_key(login, server)
 
-    with _lock:
-        session = _sessions.get(key)
-
-    if session is None:
+    w = _get_worker(login, server)
+    if not w:
         return jsonify({"ok": False, "message": "Session introuvable."}), 404
-
-    if not MT5_AVAILABLE:
-        return jsonify({"ok": True, "deals": []}), 200
-
-    if mt5.account_info() is None or str(mt5.account_info().login) != login:
-        ok, err = _login_account(session["login"], session["password"], session["server"])
-        if not ok:
-            return jsonify({"ok": False, "message": err}), 500
-
-    from_ts = int((time.time() - days * 86400))
-    to_ts   = int(time.time()) + 60
-
-    deals = mt5.history_deals_get(from_ts, to_ts)
-    result = []
-    if deals:
-        for d in deals:
-            if d.profit == 0 and d.entry == mt5.DEAL_ENTRY_IN:
-                continue  # ignorer les ouvertures à profit 0
-            result.append({
-                "ticket":    d.ticket,
-                "symbol":    d.symbol,
-                "type":      "BUY" if d.type == mt5.DEAL_TYPE_BUY else "SELL",
-                "volume":    d.volume,
-                "price":     round(d.price, 5),
-                "profit":    round(d.profit, 2),
-                "commission":round(d.commission, 2),
-                "swap":      round(d.swap, 2),
-                "comment":   d.comment,
-                "time":      datetime.fromtimestamp(d.time, tz=timezone.utc).isoformat(),
-            })
-
-    return jsonify({"ok": True, "deals": result})
+    try:
+        res = _worker_post(w["port"], "/history", {"days": days}, timeout=15.0)
+        return jsonify(res.json()), res.status_code
+    except Exception as exc:
+        return jsonify({"ok": False, "message": f"Worker injoignable: {exc}"}), 502
 
 
 @app.route("/symbol_info", methods=["POST"])
 def symbol_info_route():
-    """Utilitaire : résolution de symbole avec suffixe automatique."""
     guard = _check_secret()
     if guard:
         return guard
-
     data   = request.json or {}
+    login  = str(data.get("login", "")).strip()
+    server = str(data.get("server", "")).strip()
     symbol = str(data.get("symbol", "")).strip()
 
-    if not symbol:
-        return jsonify({"ok": False, "message": "symbol obligatoire."}), 400
-
-    resolved = _resolve_symbol(symbol)
-    if resolved is None:
-        return jsonify({"ok": False, "message": f"Symbole '{symbol}' introuvable."}), 404
-
-    info = mt5.symbol_info(resolved) if MT5_AVAILABLE else None
-    return jsonify({
-        "ok": True,
-        "original": symbol,
-        "resolved": resolved,
-        "info": {
-            "bid": round(info.bid, 5),
-            "ask": round(info.ask, 5),
-            "spread": info.spread,
-            "digits": info.digits,
-            "volume_min": info.volume_min,
-            "volume_step": info.volume_step,
-        } if info else None,
-    })
-
-
-# ── Sync automatique en arrière-plan ───────────────────────────────────────────
-
-def _auto_sync_worker():
-    """Rafraîchit silencieusement les sessions toutes les SYNC_INTERVAL secondes."""
-    while True:
-        time.sleep(SYNC_INTERVAL)
-        if not MT5_AVAILABLE:
-            continue
+    # Si un compte précis est fourni, on interroge son worker.
+    w = _get_worker(login, server) if login and server else None
+    if not w:
+        # Sinon, on prend n'importe quel worker connecté (les symboles broker sont communs).
         with _lock:
-            keys = list(_sessions.keys())
-        for key in keys:
-            with _lock:
-                session = _sessions.get(key)
-            if session is None:
-                continue
-            try:
-                current_info = mt5.account_info()
-                if current_info is None or str(current_info.login) != session["login"]:
-                    ok, _ = _login_account(
-                        session["login"], session["password"], session["server"]
-                    )
-                    if not ok:
-                        continue
-                account = _account_info_dict(session["login"], session["server"])
-                if account:
-                    with _lock:
-                        if key in _sessions:
-                            _sessions[key]["account"]   = account
-                            _sessions[key]["last_sync"] = time.time()
-                    log.debug("Auto-sync OK: %s  balance=%.2f", key, account["balance"])
-            except Exception as exc:
-                log.warning("Auto-sync erreur pour %s: %s", key, exc)
+            w = next(iter(_workers.values()), None)
+    if not w:
+        return jsonify({"ok": False, "message": "Aucun compte connecté pour résoudre le symbole."}), 404
+    try:
+        res = _worker_post(w["port"], "/symbol_info", {"symbol": symbol}, timeout=8.0)
+        return jsonify(res.json()), res.status_code
+    except Exception as exc:
+        return jsonify({"ok": False, "message": f"Worker injoignable: {exc}"}), 502
 
 
-# ── Point d'entrée ─────────────────────────────────────────────────────────────
+@app.route("/disconnect", methods=["POST"])
+def disconnect():
+    guard = _check_secret()
+    if guard:
+        return guard
+    data   = request.json or {}
+    login  = str(data.get("login", "")).strip()
+    server = str(data.get("server", "")).strip()
+    _kill_worker(login, server)
+    return jsonify({"ok": True})
+
+
+# ── Surveillance des workers morts ─────────────────────────────────────────────
+def _reaper():
+    """Nettoie le registre des workers dont le processus s'est arrêté."""
+    while True:
+        time.sleep(20)
+        dead = []
+        with _lock:
+            for key, w in list(_workers.items()):
+                if w["proc"].poll() is not None:  # processus terminé
+                    dead.append(key)
+            for key in dead:
+                _workers.pop(key, None)
+        for key in dead:
+            log.warning("Worker mort détecté et retiré du registre: %s", key)
+
+
+# ── Arrêt propre : on tue tous les workers ──────────────────────────────────────
+def _shutdown_all():
+    with _lock:
+        items = list(_workers.values())
+    for w in items:
+        _kill_worker(w["login"], w["server"])
+
 
 if __name__ == "__main__":
     log.info("=" * 60)
-    log.info("ANCIENFX MT5 Bridge — port %d", BRIDGE_PORT)
+    log.info("ANCIENFX MT5 Bridge (MANAGER multi-terminal) — port %d", BRIDGE_PORT)
     log.info("MT5 disponible : %s", MT5_AVAILABLE)
+    log.info("Instances dir  : %s", provision.INSTANCES_DIR)
+    log.info("Terminal base  : %s", provision.BASE_TERMINAL)
+    log.info("Max workers    : %d", MAX_WORKERS)
     if BRIDGE_SECRET:
         log.info("Sécurité : X-Bridge-Secret activé")
     log.info("=" * 60)
 
-    # Pré-attacher le terminal au démarrage
-    if MT5_AVAILABLE:
-        if _ensure_mt5():
-            log.info("Terminal MT5 attaché au démarrage.")
-        else:
-            log.warning("Terminal MT5 non attaché. Assurez-vous qu'il est ouvert.")
+    threading.Thread(target=_reaper, daemon=True).start()
 
-    # Thread de sync automatique
-    t = threading.Thread(target=_auto_sync_worker, daemon=True)
-    t.start()
-
-    # Flask — écoute uniquement en local (127.0.0.1) par sécurité
-    app.run(host="127.0.0.1", port=BRIDGE_PORT, debug=False, threaded=True)
+    try:
+        app.run(host="127.0.0.1", port=BRIDGE_PORT, debug=False, threaded=True)
+    finally:
+        log.info("Arrêt du manager — fermeture de tous les workers...")
+        _shutdown_all()

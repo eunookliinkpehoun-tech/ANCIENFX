@@ -1,101 +1,127 @@
-# ANCIENFX — MT5 Bridge
+# ANCIENFX — MT5 Bridge (multi-terminal)
 
-Serveur Python léger qui permet à l'application Next.js de communiquer avec MetaTrader 5 via HTTP.
+Moteur Python qui permet à l'application Next.js de piloter **plusieurs comptes MetaTrader 5 connectés SIMULTANÉMENT** via HTTP.
 
 ---
 
-## Architecture
+## Le problème résolu
+
+La librairie Python `MetaTrader5` ne peut piloter **qu'un seul terminal par processus**, et un terminal MT5 n'est connecté qu'à **un seul compte à la fois**. Pour connecter 20+ comptes en même temps (master + slaves), il faut donc :
+
+- **1 processus Python par compte** (`worker.py`)
+- **1 instance portable du terminal MT5 par compte** (copiée par `provision.py`)
+- **1 manager** (`bridge.py`) qui orchestre tout et expose une API HTTP unique
 
 ```
-[Next.js / Vercel]  --HTTP-->  [MT5 Bridge (Flask, port 8765)]  --IPC-->  [MT5 Terminal]
+[Next.js / Vercel]
+        │  HTTP (MT5_BRIDGE_URL)
+        ▼
+[bridge.py — MANAGER, port 8765]
+        │  spawn / proxy / kill
+   ┌────┼──────────────┐
+   ▼    ▼              ▼
+worker worker   ...   worker            (jusqu'à MAX_WORKERS)
+login A login B       login N
+term. A term. B       term. N           (instances MT5 séparées, portable)
+:9101   :9102         :91xx
 ```
 
-- Le bridge tourne **uniquement sur le VPS Windows** où MT5 est installé.
-- Next.js l'appelle via la variable d'environnement `MT5_BRIDGE_URL`.
-- **Aucun chemin hardcodé** : `mt5.initialize()` s'attache au terminal déjà ouvert.
+Chaque compte a **son** processus + **son** terminal → **tous connectés en même temps**, aucun conflit.
+
+---
+
+## Composants
+
+| Fichier | Rôle |
+|---|---|
+| `bridge.py` | **Manager**. Point d'entrée HTTP unique appelé par Next.js. Lance/arrête/proxy les workers. |
+| `worker.py` | **1 worker = 1 processus = 1 terminal = 1 compte.** Parle directement à MetaTrader5. |
+| `provision.py` | Crée une copie portable dédiée du terminal MT5 pour chaque compte. |
+| `start.bat` | Lanceur VPS : installe les dépendances puis démarre le manager. |
 
 ---
 
 ## Pré-requis
 
-| Logiciel | Version minimale | Note |
-|---|---|---|
-| Windows 10/11 ou Windows Server | — | Requis par MetaTrader5 |
-| MetaTrader 5 Terminal | Dernière version stable | Doit être ouvert avant le bridge |
-| Python | 3.10+ (`C:\Python314\python.exe`) | Votre VPS : déjà installé |
-| Packages Python | Flask, MetaTrader5 | Installés automatiquement par `start.bat` |
+| Logiciel | Note |
+|---|---|
+| Windows 10/11 ou Windows Server | Requis par MetaTrader5 |
+| MetaTrader 5 Terminal installé | `C:\Program Files\MetaTrader 5\terminal64.exe` (source à copier) |
+| Python 3.10+ | Votre VPS : `C:\Python314\python.exe` |
+| Espace disque | ~40–80 Mo par compte (copie légère du terminal) |
+
+> **Pas besoin d'ouvrir MT5 à la main.** Le manager lance une instance dédiée par compte automatiquement.
 
 ---
 
 ## Démarrage (une seule fois par session VPS)
 
-**1. Ouvrez MetaTrader 5** (ou laissez `start.bat` le faire automatiquement).
+**Double-cliquez sur `start.bat`** dans le dossier `mt5_bridge/`.
 
-**2. Double-cliquez sur `start.bat`** dans le dossier `mt5_bridge/`.
+Le script installe les dépendances Python puis démarre le manager sur le port 8765. Gardez la fenêtre ouverte.
 
-C'est tout. Le bridge se lance, attend les connexions de Next.js.
-
-> Ne fermez **pas** la fenêtre du terminal — elle doit rester ouverte.
+Quand un compte se connecte depuis l'interface ANCIENFX :
+1. Le manager copie le terminal MT5 dans `C:\ancienfx_mt5\<login>\` (première fois seulement).
+2. Il lance un worker qui ouvre cette instance en mode `/portable` et se connecte au compte.
+3. Le compte reste connecté tant que le worker tourne — en parallèle de tous les autres.
 
 ---
 
-## Variables d'environnement (côté Next.js / Vercel)
+## Variables d'environnement
+
+### Côté Next.js / Vercel
 
 ```env
-# URL du bridge (adapter si le VPS est distant via tunnel)
 MT5_BRIDGE_URL=http://127.0.0.1:8765
+BRIDGE_SECRET=votre_secret_ici      # optionnel mais recommandé si exposé
+```
 
-# Optionnel : secret partagé pour sécuriser le bridge
-BRIDGE_SECRET=votre_secret_ici
+### Côté manager (définies dans `start.bat`, ajustables)
+
+```env
+BRIDGE_PORT=8765
+MT5_BASE_TERMINAL=C:\Program Files\MetaTrader 5\terminal64.exe
+MT5_INSTANCES_DIR=C:\ancienfx_mt5
+MAX_WORKERS=40
+WORKER_PORT_BASE=9101
+PYTHON_EXE=C:\Python314\python.exe
 ```
 
 ---
 
-## Exposition via tunnel (si le VPS est distant)
+## Exposition via tunnel (si Next.js est sur Vercel et le VPS distant)
 
-Si Next.js est déployé sur Vercel et le VPS est une machine Windows distante, le bridge doit être exposé publiquement.
-
-**Option recommandée : Cloudflare Tunnel (gratuit)**
+**Cloudflare Tunnel (gratuit) :**
 
 ```bat
-REM Installer cloudflared
 winget install Cloudflare.cloudflared
-
-REM Lancer le tunnel
 cloudflared tunnel --url http://127.0.0.1:8765
 ```
 
-Cloudflare vous donnera une URL `https://xxxx.trycloudflare.com` à mettre dans `MT5_BRIDGE_URL`.
-
-**Autres options :** ngrok, Tailscale, VPN site-to-site.
+Mettez l'URL `https://xxxx.trycloudflare.com` fournie dans `MT5_BRIDGE_URL`, et **activez `BRIDGE_SECRET`**.
 
 ---
 
-## Routes disponibles
+## Routes exposées par le manager
 
 | Méthode | Route | Description |
 |---|---|---|
-| GET | `/health` | Statut du bridge et du terminal MT5 |
-| POST | `/connect` | Connexion d'un compte (`login`, `password`, `server`) |
-| POST | `/sync` | Rafraîchissement des données d'un compte (`login`, `server`) |
-| POST | `/disconnect` | Suppression de la session (`login`, `server`) |
+| GET | `/health` | Statut + liste des workers actifs |
+| GET | `/accounts` | Tous les comptes connectés avec leur snapshot |
+| POST | `/connect` | Connexion d'un compte (`login`, `password`, `server`) → lance un worker |
+| POST | `/sync` | Rafraîchit les données d'un compte (`login`, `server`) |
+| POST | `/disconnect` | Arrête le worker du compte (`login`, `server`) |
 | POST | `/positions` | Positions ouvertes (`login`, `server`) |
-| POST | `/history` | Historique des trades (`login`, `server`, `days`) |
-| POST | `/symbol_info` | Info + résolution automatique d'un symbole (`symbol`) |
+| POST | `/history` | Historique (`login`, `server`, `days`) |
+| POST | `/symbol_info` | Résolution de symbole (`symbol`, + `login`/`server` optionnels) |
+
+Le contrat HTTP est **identique** à la version mono-terminal : le code Next.js (`lib/mt5/service.ts`) n'a pas à changer.
 
 ---
 
 ## Résolution automatique des symboles
 
-Si votre broker utilise des suffixes (`EURUSDm`, `EURUSD.a`, etc.), le bridge les résout automatiquement via l'endpoint `/symbol_info`.
-
----
-
-## Sécurité
-
-- Le bridge écoute uniquement sur `127.0.0.1` (loopback) par défaut.
-- Activez `BRIDGE_SECRET` pour ajouter une authentification par header `X-Bridge-Secret`.
-- Si vous exposez le bridge via tunnel, **activez impérativement** `BRIDGE_SECRET`.
+Suffixes broker (`EURUSDm`, `EURUSD.a`, etc.) résolus automatiquement par chaque worker selon son propre broker.
 
 ---
 
@@ -103,10 +129,12 @@ Si votre broker utilise des suffixes (`EURUSDm`, `EURUSD.a`, etc.), le bridge le
 
 | Problème | Solution |
 |---|---|
-| `mt5.initialize()` échoue | Vérifiez que MetaTrader 5 est bien ouvert |
-| `mt5.login()` retourne code -6 | Mauvais mot de passe ou serveur broker incorrect |
-| Port 8765 occupé | Changez `BRIDGE_PORT` dans `start.bat` |
-| `ModuleNotFoundError: MetaTrader5` | Relancez `start.bat` (installe les dépendances) |
+| `Provisioning échoué` | Vérifiez `MT5_BASE_TERMINAL` (chemin du terminal source) |
+| Worker non prêt (timeout) | Mauvais mot de passe/serveur, ou 1er lancement lent → augmentez `WORKER_BOOT_TIMEOUT` |
+| `Limite de N comptes atteinte` | Augmentez `MAX_WORKERS` dans `start.bat` |
+| `ModuleNotFoundError: requests` | Relancez `start.bat` (installe les dépendances) |
+| Disque plein | Chaque compte = une copie du terminal. Supprimez les instances inutilisées dans `C:\ancienfx_mt5\` |
+| Compte connecté mais infos illisibles | Le broker rejette la lecture → vérifiez que le compte est actif chez le broker |
 
 ---
 
@@ -117,4 +145,4 @@ Login  : 436507179
 Server : Exness-MT5Trial9
 ```
 
-> Le mot de passe n'est jamais stocké dans ce fichier — il est saisi depuis l'interface ANCIENFX.
+> Le mot de passe n'est jamais stocké dans ce dépôt — il est saisi depuis l'interface ANCIENFX et transmis au worker à la volée.
