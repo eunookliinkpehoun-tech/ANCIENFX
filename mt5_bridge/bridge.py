@@ -183,6 +183,13 @@ def _spawn_worker_locked(login: str, password: str, server: str) -> tuple[bool, 
     except Exception as exc:
         return False, f"Provisioning échoué: {exc}", None
 
+    # 1b) Nettoyage des fichiers de lock stales d'une session precedente.
+    #     Sans ca, mt5.initialize() echoue avec -10005 si le terminal avait
+    #     ete tue brutalement et n'a pas pu supprimer ses propres locks.
+    cleaned = provision.cleanup_stale_locks(login)
+    if cleaned:
+        log.info("Locks stales supprimes pour %s: %d fichier(s)", login, len(cleaned))
+
     # 2) Port libre
     try:
         port = _free_port()

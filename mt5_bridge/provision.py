@@ -89,6 +89,57 @@ def ensure_instance(login: str) -> str:
     return str(target_exe)
 
 
+def cleanup_stale_locks(login: str) -> list:
+    """
+    Supprime les fichiers de lock / temp stales qui empechent mt5.initialize()
+    d'etablir le canal IPC apres un arret non-propre du terminal.
+
+    MT5 cree ces fichiers quand il tourne et ne les supprime pas si le process
+    est tue brutalement. Au redemarrage, il voit ces fichiers et refuse de
+    demarrer en mode IPC (-> code -10005).
+
+    Retourne la liste des fichiers supprimes (pour le log).
+    """
+    target = Path(INSTANCES_DIR) / str(login)
+    if not target.exists():
+        return []
+
+    # Patterns de fichiers de lock connus de MT5
+    lock_patterns = [
+        "*.tmp",
+        "*.lock",
+        "terminal.dat",
+        "terminal.hst",
+        "metaeditor.dat",
+    ]
+    # Sous-dossiers ou MT5 stocke ses locks
+    lock_dirs = [target, target / "MQL5", target / "config"]
+
+    removed = []
+    for d in lock_dirs:
+        if not d.exists():
+            continue
+        for pattern in lock_patterns:
+            for f in d.glob(pattern):
+                try:
+                    f.unlink()
+                    removed.append(str(f))
+                    log.info("Lock stale supprime: %s", f)
+                except Exception as exc:
+                    log.warning("Impossible de supprimer %s: %s", f, exc)
+
+    # Supprimer aussi le fichier de socket IPC si present
+    ipc_sock = target / "terminal.sock"
+    if ipc_sock.exists():
+        try:
+            ipc_sock.unlink()
+            removed.append(str(ipc_sock))
+        except Exception:
+            pass
+
+    return removed
+
+
 def remove_instance(login: str) -> bool:
     """
     Supprime l'instance d'un compte (libère l'espace disque).
