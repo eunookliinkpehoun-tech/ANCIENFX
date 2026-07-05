@@ -59,8 +59,7 @@ export function Mt5ConnectModal() {
   const [broker, setBroker] = useState("")
   const [server, setServer] = useState("")
 
-  if (!connectModalOpen) return null
-
+  // Tous les hooks AVANT tout return conditionnel (règle des hooks React)
   const trialActive = state?.user.trialActive
 
   // Suggestions de serveurs selon le broker sélectionné
@@ -75,6 +74,9 @@ export function Mt5ConnectModal() {
       .flatMap(([, v]) => v)
     return partial.length > 0 ? partial : Object.values(BROKER_SERVERS).flat()
   }, [broker])
+
+  // Return conditionnel uniquement après tous les hooks
+  if (!connectModalOpen) return null
 
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault()
