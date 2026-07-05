@@ -52,7 +52,7 @@ BRIDGE_PORT    = int(os.environ.get("BRIDGE_PORT", 8765))
 BRIDGE_SECRET  = os.environ.get("BRIDGE_SECRET", "")
 WORKER_PORT_BASE = int(os.environ.get("WORKER_PORT_BASE", 9101))
 MAX_WORKERS    = int(os.environ.get("MAX_WORKERS", 40))
-WORKER_BOOT_TIMEOUT = int(os.environ.get("WORKER_BOOT_TIMEOUT", 45))  # sec
+WORKER_BOOT_TIMEOUT = int(os.environ.get("WORKER_BOOT_TIMEOUT", 90))  # sec
 PYTHON_EXE     = os.environ.get("PYTHON_EXE", sys.executable)
 
 try:
@@ -175,6 +175,7 @@ def _spawn_worker_locked(login: str, password: str, server: str) -> tuple[bool, 
         cmd += ["--secret", BRIDGE_SECRET]
 
     log.info("Lancement worker %s@%s sur port %d", login, server, port)
+    log.info("  terminal: %s", terminal_path)
     try:
         proc = subprocess.Popen(
             cmd,

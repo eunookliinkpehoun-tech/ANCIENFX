@@ -21,8 +21,26 @@ export function isTrialActive(trialEndsAt: Date | string | null): boolean {
   return new Date(trialEndsAt).getTime() > Date.now()
 }
 
+/**
+ * Heuristique "best-effort" sur le nom du serveur.
+ * Ne retourne true QUE si le serveur contient explicitement "demo" ou "test".
+ * Les comptes sans ce mot-clé sont traités comme "inconnus" jusqu'à confirmation
+ * par le bridge (account.isDemo renvoyé par MT5 fait foi).
+ */
 export function isDemoServer(server: string): boolean {
-  return /demo/i.test(server)
+  return /\b(demo|test)\b/i.test(server)
+}
+
+/**
+ * Un serveur est accepté pendant la période d'essai si :
+ * - son nom contient "demo" / "test" (heuristique), OU
+ * - on ne peut pas le déterminer à l'avance (le bridge le vérifiera).
+ * On ne bloque plus à l'entrée : la vérification définitive se fait
+ * après retour du bridge (account.isDemo).
+ */
+export function serverAllowedDuringTrial(server: string): boolean {
+  // Refuser seulement si le serveur mentionne explicitement "live", "real" ou "prod"
+  return !/\b(live|real|prod)\b/i.test(server)
 }
 
 export function computePlatformShare(profit: number): number {

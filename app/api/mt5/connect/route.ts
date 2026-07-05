@@ -5,7 +5,7 @@ import {
   ensureTrialPeriod,
   getDashboardState,
   getSessionUser,
-  isDemoServer,
+  serverAllowedDuringTrial,
   isTrialActive,
 } from "@/lib/dashboard"
 import { connectMt5Account } from "@/lib/mt5/service"
@@ -34,9 +34,11 @@ export async function POST(request: Request) {
     )
     const user = userRows[0]
     const trialActive = isTrialActive(user?.trial_ends_at)
-    const isDemo = isDemoServer(server)
 
-    if (trialActive && !isDemo) {
+    // Pré-filtre léger : bloquer seulement les serveurs qui mentionnent
+    // explicitement "live" / "real" / "prod" pendant la période d'essai.
+    // La vérification définitive se fait après le retour du bridge (account.isDemo).
+    if (trialActive && !serverAllowedDuringTrial(server)) {
       return NextResponse.json(
         {
           ok: false,
@@ -47,21 +49,17 @@ export async function POST(request: Request) {
       )
     }
 
-    if (!trialActive && isDemo) {
+    // Connexion via le bridge (détermine réellement si le compte est demo)
+    const account = await connectMt5Account({ login, password, server })
+
+    // Vérification définitive après retour du bridge
+    if (trialActive && !account.isDemo) {
       return NextResponse.json(
         {
           ok: false,
-          message: "Votre période d'essai est terminée. Veuillez connecter un compte RÉEL.",
+          message:
+            "Ce compte n'est pas un compte démo. Seuls les comptes DEMO sont autorisés pendant la période d'essai.",
         },
-        { status: 403 },
-      )
-    }
-
-    const account = await connectMt5Account({ login, password, server })
-
-    if (trialActive && !account.isDemo) {
-      return NextResponse.json(
-        { ok: false, message: "Ce compte n'est pas un compte démo. Connexion refusée pendant l'essai." },
         { status: 403 },
       )
     }
