@@ -138,8 +138,18 @@ def _wait_worker_ready(port: int, timeout: int) -> tuple[bool, str]:
     return False, last_err
 
 
+# Sérialise les démarrages à froid : lancer 20 terminaux d'un coup provoque des
+# -10005 (IPC_TIMEOUT). On démarre les terminaux un par un.
+_spawn_lock = threading.Lock()
+
+
 def _spawn_worker(login: str, password: str, server: str) -> tuple[bool, str, Optional[int]]:
     """Provisionne l'instance terminal + lance le worker. Retourne (ok, err, port)."""
+    with _spawn_lock:
+        return _spawn_worker_locked(login, password, server)
+
+
+def _spawn_worker_locked(login: str, password: str, server: str) -> tuple[bool, str, Optional[int]]:
     # 1) Instance portable dédiée du terminal
     try:
         terminal_path = provision.ensure_instance(login)
