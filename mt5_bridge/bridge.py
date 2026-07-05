@@ -152,8 +152,17 @@ def _wait_worker_ready(port: int, timeout: int) -> tuple[bool, str]:
             pass
         time.sleep(1.0)
     if not http_alive:
-        return False, "Le worker n'a pas demarré (Flask inaccessible) — verifier Python/port."
-    return False, f"Connexion broker MT5 timeout apres {timeout}s. Derniere erreur: {last_err}"
+        return False, "Le worker n'a pas demarre (Flask inaccessible) — verifier Python/port."
+    # Derniere chance : lire last_error courant du worker avant de le tuer
+    try:
+        res = _worker_get(port, "/health", timeout=3.0)
+        if res.ok:
+            final_err = res.json().get("last_error", last_err)
+            if final_err:
+                last_err = final_err
+    except Exception:
+        pass
+    return False, f"Connexion broker MT5 timeout apres {timeout}s. Erreur MT5: {last_err}"
 
 
 # Sérialise les démarrages à froid : lancer 20 terminaux d'un coup provoque des
@@ -194,15 +203,23 @@ def _spawn_worker_locked(login: str, password: str, server: str) -> tuple[bool, 
 
     log.info("Lancement worker %s@%s sur port %d", login, server, port)
     log.info("  terminal: %s", terminal_path)
+
+    # Log du worker dans un fichier dedie pour pouvoir diagnostiquer les erreurs MT5
+    log_dir = os.path.join(_HERE, "worker_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"worker_{login}.log")
+
     try:
+        log_fh = open(log_file, "a", buffering=1)
         proc = subprocess.Popen(
             cmd,
             cwd=_HERE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
         )
     except Exception as exc:
         return False, f"Impossible de lancer le worker: {exc}", None
+    log.info("  logs worker -> %s", log_file)
 
     with _lock:
         _workers[_key(login, server)] = {

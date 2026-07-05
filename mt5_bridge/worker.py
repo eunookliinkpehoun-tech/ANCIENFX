@@ -599,22 +599,30 @@ def _auto_sync():
 
 
 # ── Démarrage ────────────────────────────────────────────────────────────────────
+RECONNECT_INTERVAL = 30  # secondes entre les tentatives de reconnexion auto
+
+
 def _init_in_background():
     """
-    Init MT5 en arriere-plan pour que Flask soit disponible immediatement.
-    Le manager interroge /health en boucle jusqu'a logged=True.
-    Cela resout le probleme des brokers lents (XMGlobal, FTMO...) qui peuvent
-    prendre 60-120s pour etablir la connexion broker : le worker repond deja
-    au /health du manager pendant ce temps, au lieu de paraitre "mort".
+    Init MT5 en arriere-plan. Le worker NE QUITTE PAS si le login echoue :
+    il continue de repondre a /health (logged=False, last_error=...) et
+    retente la connexion automatiquement jusqu'a succes ou arret explicite.
+    Cela permet au manager de lire l'erreur exacte au lieu de voir "process mort".
     """
     log.info("Init MT5 en arriere-plan pour %s@%s ...", ARGS.login, ARGS.server)
-    ok, err = _initialize_and_login()
-    if ok:
-        log.info("Connecte au compte %s@%s", ARGS.login, ARGS.server)
-    else:
+    attempt = 0
+    while True:
+        attempt += 1
+        log.info("[background] Tentative de connexion #%d pour %s@%s", attempt, ARGS.login, ARGS.server)
+        ok, err = _initialize_and_login()
+        if ok:
+            log.info("Connecte au compte %s@%s", ARGS.login, ARGS.server)
+            return
         with _lock:
             _state["last_error"] = err
-        log.error("Connexion initiale echouee: %s", err)
+        log.error("[background] Connexion echouee (tentative %d): %s", attempt, err)
+        log.info("[background] Nouvelle tentative dans %ds...", RECONNECT_INTERVAL)
+        time.sleep(RECONNECT_INTERVAL)
 
 
 if __name__ == "__main__":
