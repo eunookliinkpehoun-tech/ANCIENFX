@@ -257,6 +257,252 @@ def symbol_info_route():
     })
 
 
+def _ensure_symbol_ready(symbol: str) -> Optional[str]:
+    """Résout + rend le symbole visible dans le Market Watch avant de trader."""
+    resolved = _resolve_symbol(symbol)
+    if resolved is None:
+        return None
+    info = mt5.symbol_info(resolved)
+    if info is None:
+        return None
+    if not info.visible:
+        mt5.symbol_select(resolved, True)
+        time.sleep(0.05)
+    return resolved
+
+
+def _filling_mode(symbol: str):
+    """Détermine le mode de remplissage supporté par le symbole/broker."""
+    info = mt5.symbol_info(symbol)
+    if info is not None:
+        mode = info.filling_mode
+        if mode & 1:  # SYMBOL_FILLING_FOK
+            return mt5.ORDER_FILLING_FOK
+        if mode & 2:  # SYMBOL_FILLING_IOC
+            return mt5.ORDER_FILLING_IOC
+    return mt5.ORDER_FILLING_RETURN
+
+
+@app.route("/open", methods=["POST"])
+def open_position():
+    """
+    Ouvre une position marché.
+    Body: {symbol, type: BUY|SELL, volume, sl?, tp?, magic?, comment?, deviation?}
+    """
+    guard = _check_secret()
+    if guard:
+        return guard
+    if not MT5_AVAILABLE:
+        return jsonify({"ok": False, "message": "MT5 indisponible."}), 503
+
+    data = request.json or {}
+    raw_symbol = str(data.get("symbol", "")).strip()
+    side = str(data.get("type", "")).upper()
+    volume = float(data.get("volume", 0))
+    sl = float(data.get("sl", 0) or 0)
+    tp = float(data.get("tp", 0) or 0)
+    magic = int(data.get("magic", 0) or 0)
+    comment = str(data.get("comment", "ANCIENFX"))[:31]
+    deviation = int(data.get("deviation", 20))
+
+    if not raw_symbol or side not in ("BUY", "SELL") or volume <= 0:
+        return jsonify({"ok": False, "message": "symbol, type (BUY/SELL) et volume>0 requis."}), 400
+
+    symbol = _ensure_symbol_ready(raw_symbol)
+    if symbol is None:
+        return jsonify({"ok": False, "message": f"Symbole '{raw_symbol}' indisponible sur ce broker."}), 404
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return jsonify({"ok": False, "message": "Prix indisponible."}), 503
+
+    order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
+    price = tick.ask if side == "BUY" else tick.bid
+
+    # Normalise le volume aux contraintes du symbole
+    info = mt5.symbol_info(symbol)
+    step = info.volume_step or 0.01
+    volume = max(info.volume_min, min(info.volume_max, round(volume / step) * step))
+    volume = round(volume, 2)
+
+    req = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": volume,
+        "type": order_type,
+        "price": price,
+        "deviation": deviation,
+        "magic": magic,
+        "comment": comment,
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": _filling_mode(symbol),
+    }
+    if sl > 0:
+        req["sl"] = sl
+    if tp > 0:
+        req["tp"] = tp
+
+    result = mt5.order_send(req)
+    if result is None:
+        code, msg = mt5.last_error()
+        return jsonify({"ok": False, "message": f"order_send nul (code {code}): {msg}"}), 502
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        return jsonify({"ok": False, "message": f"Ordre rejeté (retcode {result.retcode}): {result.comment}", "retcode": result.retcode}), 502
+
+    return jsonify({
+        "ok": True,
+        "ticket": result.order,
+        "position": getattr(result, "position", result.order),
+        "volume": volume,
+        "price": round(result.price, 5),
+        "symbol": symbol,
+    })
+
+
+@app.route("/close", methods=["POST"])
+def close_position():
+    """
+    Ferme une position par ticket (partiellement si volume fourni).
+    Body: {ticket, volume?, deviation?}
+    """
+    guard = _check_secret()
+    if guard:
+        return guard
+    if not MT5_AVAILABLE:
+        return jsonify({"ok": False, "message": "MT5 indisponible."}), 503
+
+    data = request.json or {}
+    ticket = int(data.get("ticket", 0) or 0)
+    deviation = int(data.get("deviation", 20))
+    if ticket <= 0:
+        return jsonify({"ok": False, "message": "ticket requis."}), 400
+
+    pos_list = mt5.positions_get(ticket=ticket)
+    if not pos_list:
+        # Déjà fermée → succès idempotent
+        return jsonify({"ok": True, "already_closed": True})
+    pos = pos_list[0]
+
+    volume = float(data.get("volume", pos.volume) or pos.volume)
+    volume = min(volume, pos.volume)
+
+    tick = mt5.symbol_info_tick(pos.symbol)
+    if tick is None:
+        return jsonify({"ok": False, "message": "Prix indisponible."}), 503
+
+    # Sens inverse pour clôturer
+    if pos.type == mt5.ORDER_TYPE_BUY:
+        close_type = mt5.ORDER_TYPE_SELL
+        price = tick.bid
+    else:
+        close_type = mt5.ORDER_TYPE_BUY
+        price = tick.ask
+
+    req = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": pos.symbol,
+        "volume": round(volume, 2),
+        "type": close_type,
+        "position": ticket,
+        "price": price,
+        "deviation": deviation,
+        "magic": pos.magic,
+        "comment": "ANCIENFX close",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": _filling_mode(pos.symbol),
+    }
+    result = mt5.order_send(req)
+    if result is None:
+        code, msg = mt5.last_error()
+        return jsonify({"ok": False, "message": f"order_send nul (code {code}): {msg}"}), 502
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        return jsonify({"ok": False, "message": f"Clôture rejetée (retcode {result.retcode}): {result.comment}", "retcode": result.retcode}), 502
+
+    return jsonify({"ok": True, "ticket": ticket, "closed_volume": round(volume, 2)})
+
+
+@app.route("/modify", methods=["POST"])
+def modify_position():
+    """
+    Modifie le SL/TP d'une position.
+    Body: {ticket, sl?, tp?}
+    """
+    guard = _check_secret()
+    if guard:
+        return guard
+    if not MT5_AVAILABLE:
+        return jsonify({"ok": False, "message": "MT5 indisponible."}), 503
+
+    data = request.json or {}
+    ticket = int(data.get("ticket", 0) or 0)
+    if ticket <= 0:
+        return jsonify({"ok": False, "message": "ticket requis."}), 400
+
+    pos_list = mt5.positions_get(ticket=ticket)
+    if not pos_list:
+        return jsonify({"ok": False, "message": "Position introuvable."}), 404
+    pos = pos_list[0]
+
+    sl = float(data.get("sl", pos.sl) or 0)
+    tp = float(data.get("tp", pos.tp) or 0)
+
+    req = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "symbol": pos.symbol,
+        "position": ticket,
+        "sl": sl,
+        "tp": tp,
+    }
+    result = mt5.order_send(req)
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        rc = result.retcode if result else "nul"
+        return jsonify({"ok": False, "message": f"Modification SL/TP rejetée (retcode {rc})."}), 502
+
+    return jsonify({"ok": True, "ticket": ticket, "sl": sl, "tp": tp})
+
+
+@app.route("/close_all", methods=["POST"])
+def close_all():
+    """Ferme toutes les positions (optionnellement filtrées par magic). Body: {magic?}"""
+    guard = _check_secret()
+    if guard:
+        return guard
+    if not MT5_AVAILABLE:
+        return jsonify({"ok": True, "closed": 0})
+
+    data = request.json or {}
+    magic_filter = data.get("magic")
+    positions = mt5.positions_get() or []
+    closed = 0
+    for pos in positions:
+        if magic_filter is not None and pos.magic != int(magic_filter):
+            continue
+        tick = mt5.symbol_info_tick(pos.symbol)
+        if tick is None:
+            continue
+        if pos.type == mt5.ORDER_TYPE_BUY:
+            close_type, price = mt5.ORDER_TYPE_SELL, tick.bid
+        else:
+            close_type, price = mt5.ORDER_TYPE_BUY, tick.ask
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": pos.symbol,
+            "volume": pos.volume,
+            "type": close_type,
+            "position": pos.ticket,
+            "price": price,
+            "deviation": 20,
+            "magic": pos.magic,
+            "comment": "ANCIENFX close_all",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": _filling_mode(pos.symbol),
+        }
+        res = mt5.order_send(req)
+        if res is not None and res.retcode == mt5.TRADE_RETCODE_DONE:
+            closed += 1
+    return jsonify({"ok": True, "closed": closed})
+
+
 @app.route("/shutdown", methods=["POST"])
 def shutdown():
     guard = _check_secret()

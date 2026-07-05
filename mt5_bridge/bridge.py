@@ -45,6 +45,7 @@ import requests
 from flask import Flask, jsonify, request
 
 import provision
+from copy_engine import CopyEngine, CopyConfig
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 BRIDGE_PORT    = int(os.environ.get("BRIDGE_PORT", 8765))
@@ -218,6 +219,51 @@ def _kill_worker(login: str, server: str) -> None:
 def _get_worker(login: str, server: str) -> Optional[dict]:
     with _lock:
         return _workers.get(_key(login, server))
+
+
+# ── Copy engine (master -> slaves) ───────────────────────────────────────────────
+def _node(w: dict) -> dict:
+    """Représentation légère d'un worker passée au moteur de copie."""
+    return {"key": _key(w["login"], w["server"]), "login": w["login"], "server": w["server"], "port": w["port"]}
+
+
+def _get_master_node() -> Optional[dict]:
+    """Retourne le worker maître si connecté, sinon None."""
+    login = copy_cfg.master_login
+    server = copy_cfg.master_server
+    if not login:
+        return None
+    with _lock:
+        # Si le server maître n'est pas précisé, on matche sur le login seul.
+        for w in _workers.values():
+            if str(w["login"]) == str(login) and (not server or w["server"] == server):
+                return _node(w)
+    return None
+
+
+def _list_slave_nodes() -> list:
+    """Tous les workers SAUF le maître."""
+    master_login = copy_cfg.master_login
+    master_server = copy_cfg.master_server
+    result = []
+    with _lock:
+        for w in _workers.values():
+            is_master = str(w["login"]) == str(master_login) and (
+                not master_server or w["server"] == master_server
+            )
+            if not is_master:
+                result.append(_node(w))
+    return result
+
+
+copy_cfg = CopyConfig()
+copy_engine = CopyEngine(
+    get_master=_get_master_node,
+    list_slaves=_list_slave_nodes,
+    worker_get=lambda port, path: _worker_get(port, path),
+    worker_post=lambda port, path, body: _worker_post(port, path, body),
+    config=copy_cfg,
+)
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────────
@@ -410,6 +456,59 @@ def disconnect():
     return jsonify({"ok": True})
 
 
+# ── Contrôle du moteur de copie ──────────────────────────────────────────────────
+@app.route("/copy/status", methods=["GET"])
+def copy_status():
+    guard = _check_secret()
+    if guard:
+        return guard
+    return jsonify({"ok": True, **copy_engine.status()})
+
+
+@app.route("/copy/config", methods=["POST"])
+def copy_config():
+    """
+    Met à jour la configuration du moteur de copie (à chaud).
+    Body (tous optionnels) :
+      {enabled, master_login, master_server, mode, multiplier,
+       copy_sltp, min_volume, max_volume, magic, poll_interval, slave_overrides}
+    """
+    guard = _check_secret()
+    if guard:
+        return guard
+    patch = request.json or {}
+    copy_cfg.update(patch)
+    log.info("Config copie mise à jour: enabled=%s master=%s mode=%s x%.2f",
+             copy_cfg.enabled, copy_cfg.master_login, copy_cfg.mode, copy_cfg.multiplier)
+    return jsonify({"ok": True, **copy_engine.status()})
+
+
+@app.route("/copy/enable", methods=["POST"])
+def copy_enable():
+    guard = _check_secret()
+    if guard:
+        return guard
+    data = request.json or {}
+    # Permet de définir le maître au moment de l'activation
+    if data.get("master_login"):
+        copy_cfg.master_login = str(data["master_login"]).strip()
+    if data.get("master_server"):
+        copy_cfg.master_server = str(data["master_server"]).strip()
+    copy_cfg.enabled = True
+    log.info("Copie ACTIVÉE (maître %s@%s)", copy_cfg.master_login, copy_cfg.master_server)
+    return jsonify({"ok": True, **copy_engine.status()})
+
+
+@app.route("/copy/disable", methods=["POST"])
+def copy_disable():
+    guard = _check_secret()
+    if guard:
+        return guard
+    copy_cfg.enabled = False
+    log.info("Copie DÉSACTIVÉE.")
+    return jsonify({"ok": True, **copy_engine.status()})
+
+
 # ── Surveillance des workers morts ─────────────────────────────────────────────
 def _reaper():
     """Nettoie le registre des workers dont le processus s'est arrêté."""
@@ -443,9 +542,13 @@ if __name__ == "__main__":
     log.info("Max workers    : %d", MAX_WORKERS)
     if BRIDGE_SECRET:
         log.info("Sécurité : X-Bridge-Secret activé")
+    log.info("Copie : enabled=%s  maître=%s@%s  mode=%s",
+             copy_cfg.enabled, copy_cfg.master_login or "(non défini)",
+             copy_cfg.master_server or "-", copy_cfg.mode)
     log.info("=" * 60)
 
     threading.Thread(target=_reaper, daemon=True).start()
+    copy_engine.start()
 
     try:
         app.run(host="127.0.0.1", port=BRIDGE_PORT, debug=False, threaded=True)

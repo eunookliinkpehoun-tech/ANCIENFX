@@ -252,6 +252,132 @@ export async function getMt5History(login: string, server: string, days = 30): P
   }
 }
 
+// ── Copy trading (maître → slaves) ───────────────────────────────────────────
+
+export type CopyMode = "balance" | "multiplier" | "fixed"
+
+export type CopyStatus = {
+  enabled: boolean
+  master: { login: string; server: string; connected: boolean }
+  slavesCount: number
+  trackedMasterPositions: number
+  stats: { opens: number; closes: number; modifies: number; errors: number; lastCycle: number }
+  config: Record<string, unknown>
+}
+
+export type CopyConfigPatch = {
+  enabled?: boolean
+  masterLogin?: string
+  masterServer?: string
+  mode?: CopyMode
+  multiplier?: number
+  copySltp?: boolean
+  minVolume?: number
+  maxVolume?: number
+  magic?: number
+  pollInterval?: number
+  slaveOverrides?: Record<string, { mode?: CopyMode; multiplier?: number }>
+}
+
+function mapCopyStatus(data: Record<string, unknown>): CopyStatus {
+  const master = (data.master ?? {}) as Record<string, unknown>
+  const stats = (data.stats ?? {}) as Record<string, unknown>
+  return {
+    enabled: Boolean(data.enabled),
+    master: {
+      login: String(master.login ?? ""),
+      server: String(master.server ?? ""),
+      connected: Boolean(master.connected),
+    },
+    slavesCount: Number(data.slaves_count ?? 0),
+    trackedMasterPositions: Number(data.tracked_master_positions ?? 0),
+    stats: {
+      opens: Number(stats.opens ?? 0),
+      closes: Number(stats.closes ?? 0),
+      modifies: Number(stats.modifies ?? 0),
+      errors: Number(stats.errors ?? 0),
+      lastCycle: Number(stats.last_cycle ?? 0),
+    },
+    config: (data.config ?? {}) as Record<string, unknown>,
+  }
+}
+
+/** État courant du moteur de copie. Null si le bridge est absent. */
+export async function getCopyStatus(): Promise<CopyStatus | null> {
+  const url = bridgeUrl()
+  if (!url) return null
+  try {
+    const res = await bridgeFetch("/copy/status")
+    if (!res.ok) return null
+    const data = await res.json()
+    if (!data.ok) return null
+    return mapCopyStatus(data)
+  } catch {
+    return null
+  }
+}
+
+/** Met à jour la config du moteur de copie (camelCase → snake_case pour le bridge). */
+export async function updateCopyConfig(patch: CopyConfigPatch): Promise<CopyStatus | null> {
+  const url = bridgeUrl()
+  if (!url) return null
+  const body: Record<string, unknown> = {}
+  if (patch.enabled !== undefined) body.enabled = patch.enabled
+  if (patch.masterLogin !== undefined) body.master_login = patch.masterLogin
+  if (patch.masterServer !== undefined) body.master_server = patch.masterServer
+  if (patch.mode !== undefined) body.mode = patch.mode
+  if (patch.multiplier !== undefined) body.multiplier = patch.multiplier
+  if (patch.copySltp !== undefined) body.copy_sltp = patch.copySltp
+  if (patch.minVolume !== undefined) body.min_volume = patch.minVolume
+  if (patch.maxVolume !== undefined) body.max_volume = patch.maxVolume
+  if (patch.magic !== undefined) body.magic = patch.magic
+  if (patch.pollInterval !== undefined) body.poll_interval = patch.pollInterval
+  if (patch.slaveOverrides !== undefined) body.slave_overrides = patch.slaveOverrides
+
+  try {
+    const res = await bridgeFetch("/copy/config", body)
+    if (!res.ok) return null
+    const data = await res.json()
+    if (!data.ok) return null
+    return mapCopyStatus(data)
+  } catch {
+    return null
+  }
+}
+
+/** Active la copie, en définissant optionnellement le compte maître. */
+export async function enableCopy(master?: { login: string; server?: string }): Promise<CopyStatus | null> {
+  const url = bridgeUrl()
+  if (!url) return null
+  const body: Record<string, unknown> = {}
+  if (master?.login) body.master_login = master.login
+  if (master?.server) body.master_server = master.server
+  try {
+    const res = await bridgeFetch("/copy/enable", body)
+    if (!res.ok) return null
+    const data = await res.json()
+    if (!data.ok) return null
+    return mapCopyStatus(data)
+  } catch {
+    return null
+  }
+}
+
+/** Désactive la copie (les positions ouvertes restent en place). */
+export async function disableCopy(): Promise<CopyStatus | null> {
+  const url = bridgeUrl()
+  if (!url) return null
+  try {
+    const res = await bridgeFetch("/copy/disable", {})
+    if (!res.ok) return null
+    const data = await res.json()
+    if (!data.ok) return null
+    return mapCopyStatus(data)
+  } catch {
+    return null
+  }
+}
+
 /**
  * Résout un symbole avec suffixe automatique (EURUSDm → EURUSD, etc.)
  * Retourne null si le bridge est absent ou le symbole introuvable.

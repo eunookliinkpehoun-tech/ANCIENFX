@@ -34,8 +34,9 @@ Chaque compte a **son** processus + **son** terminal → **tous connectés en m�
 
 | Fichier | Rôle |
 |---|---|
-| `bridge.py` | **Manager**. Point d'entrée HTTP unique appelé par Next.js. Lance/arrête/proxy les workers. |
-| `worker.py` | **1 worker = 1 processus = 1 terminal = 1 compte.** Parle directement à MetaTrader5. |
+| `bridge.py` | **Manager**. Point d'entrée HTTP unique appelé par Next.js. Lance/arrête/proxy les workers + héberge le moteur de copie. |
+| `worker.py` | **1 worker = 1 processus = 1 terminal = 1 compte.** Parle directement à MetaTrader5 (lecture + exécution d'ordres). |
+| `copy_engine.py` | **Moteur de copie** master → slaves. Surveille le maître et réplique ouvertures/fermetures/SL-TP. |
 | `provision.py` | Crée une copie portable dédiée du terminal MT5 pour chaque compte. |
 | `start.bat` | Lanceur VPS : installe les dépendances puis démarre le manager. |
 
@@ -114,8 +115,66 @@ Mettez l'URL `https://xxxx.trycloudflare.com` fournie dans `MT5_BRIDGE_URL`, et 
 | POST | `/positions` | Positions ouvertes (`login`, `server`) |
 | POST | `/history` | Historique (`login`, `server`, `days`) |
 | POST | `/symbol_info` | Résolution de symbole (`symbol`, + `login`/`server` optionnels) |
+| GET | `/copy/status` | État du moteur de copie (maître, nb slaves, stats) |
+| POST | `/copy/config` | Met à jour la config de copie (à chaud) |
+| POST | `/copy/enable` | Active la copie (`master_login`, `master_server` optionnels) |
+| POST | `/copy/disable` | Désactive la copie (les positions ouvertes restent) |
 
-Le contrat HTTP est **identique** à la version mono-terminal : le code Next.js (`lib/mt5/service.ts`) n'a pas à changer.
+Exécution d'ordres sur un worker (utilisée par le moteur de copie) : `/open`, `/close`, `/modify`, `/close_all`.
+
+Le contrat HTTP des routes de base est **identique** à la version mono-terminal : le code Next.js (`lib/mt5/service.ts`) n'a pas à changer.
+
+---
+
+## Copy trading (maître → slaves)
+
+Le moteur de copie vit dans le manager (`copy_engine.py`). Il surveille en continu (~1s) les positions du **compte maître** et réplique sur **tous les autres comptes connectés** (les slaves) :
+
+- **Ouverture** d'une position maître → ouverture sur chaque slave
+- **Fermeture** (totale) maître → fermeture sur chaque slave
+- **Modification SL/TP** maître → modification sur chaque slave (si `COPY_SLTP=true`)
+
+### Dimensionnement du lot
+
+| Mode | Formule | Usage |
+|---|---|---|
+| `balance` (défaut) | `lot_maître × (solde_slave / solde_maître) × multiplier` | Équilibré quel que soit le capital |
+| `multiplier` | `lot_maître × multiplier` | Coefficient fixe |
+| `fixed` | `lot_maître` | Lot identique |
+
+Chaque slave peut avoir son propre mode/coefficient via `slave_overrides` (`{"login|server": {"mode": "...", "multiplier": ...}}`).
+
+### Variables d'environnement de copie (manager)
+
+```env
+COPY_ENABLED=false                 # active la copie au démarrage
+MASTER_LOGIN=436507179             # compte maître
+MASTER_SERVER=Exness-MT5Trial9     # serveur du maître
+COPY_MODE=balance                  # balance | multiplier | fixed
+COPY_MULTIPLIER=1.0                # coefficient global
+COPY_SLTP=true                     # copier les modifications SL/TP
+COPY_MIN_VOLUME=0.01               # borne basse par ordre copié
+COPY_MAX_VOLUME=100.0              # borne haute par ordre copié
+COPY_MAGIC=20240517                # identifie les trades copiés
+COPY_POLL_INTERVAL=1.0             # fréquence de scan du maître (s)
+```
+
+### Activer la copie sans redémarrer
+
+```bat
+:: définir le maître + activer
+curl -X POST http://127.0.0.1:8765/copy/enable -H "Content-Type: application/json" ^
+  -d "{\"master_login\":\"436507179\",\"master_server\":\"Exness-MT5Trial9\"}"
+
+:: régler le mode proportionnel au solde x1
+curl -X POST http://127.0.0.1:8765/copy/config -H "Content-Type: application/json" ^
+  -d "{\"mode\":\"balance\",\"multiplier\":1.0}"
+
+:: voir l'état
+curl http://127.0.0.1:8765/copy/status
+```
+
+> Le maître **et** les slaves doivent d'abord être connectés via `/connect` (chacun a son worker). Le moteur ne copie que lorsque `enabled=true` et que le worker maître est joignable.
 
 ---
 
