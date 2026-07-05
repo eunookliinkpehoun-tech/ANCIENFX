@@ -581,15 +581,30 @@ def _auto_sync():
 
 
 # ── Démarrage ────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    log.info("Démarrage worker — terminal=%s port=%d", ARGS.terminal, ARGS.port)
+def _init_in_background():
+    """
+    Init MT5 en arriere-plan pour que Flask soit disponible immediatement.
+    Le manager interroge /health en boucle jusqu'a logged=True.
+    Cela resout le probleme des brokers lents (XMGlobal, FTMO...) qui peuvent
+    prendre 60-120s pour etablir la connexion broker : le worker repond deja
+    au /health du manager pendant ce temps, au lieu de paraitre "mort".
+    """
+    log.info("Init MT5 en arriere-plan pour %s@%s ...", ARGS.login, ARGS.server)
     ok, err = _initialize_and_login()
     if ok:
-        log.info("Connecté au compte %s@%s", ARGS.login, ARGS.server)
+        log.info("Connecte au compte %s@%s", ARGS.login, ARGS.server)
     else:
         with _lock:
             _state["last_error"] = err
-        log.error("Connexion initiale échouée: %s", err)
+        log.error("Connexion initiale echouee: %s", err)
 
+
+if __name__ == "__main__":
+    log.info("Demarrage worker — terminal=%s port=%d", ARGS.terminal, ARGS.port)
+
+    # IMPORTANT : Flask demarre AVANT l'init MT5 (en background).
+    # Sans ca, le manager voit "pas de reponse" pendant toute la connexion broker
+    # et tue le worker avant meme qu'il ait eu le temps de se connecter.
+    threading.Thread(target=_init_in_background, daemon=True).start()
     threading.Thread(target=_auto_sync, daemon=True).start()
     app.run(host="127.0.0.1", port=ARGS.port, debug=False, threaded=True)

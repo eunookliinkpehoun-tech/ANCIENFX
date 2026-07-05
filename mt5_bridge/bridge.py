@@ -52,7 +52,7 @@ BRIDGE_PORT    = int(os.environ.get("BRIDGE_PORT", 8765))
 BRIDGE_SECRET  = os.environ.get("BRIDGE_SECRET", "")
 WORKER_PORT_BASE = int(os.environ.get("WORKER_PORT_BASE", 9101))
 MAX_WORKERS    = int(os.environ.get("MAX_WORKERS", 40))
-WORKER_BOOT_TIMEOUT = int(os.environ.get("WORKER_BOOT_TIMEOUT", 90))  # sec
+WORKER_BOOT_TIMEOUT = int(os.environ.get("WORKER_BOOT_TIMEOUT", 180))  # sec — laisser le temps aux brokers lents
 PYTHON_EXE     = os.environ.get("PYTHON_EXE", sys.executable)
 
 try:
@@ -120,22 +120,40 @@ def _worker_post(port: int, path: str, body: dict, timeout: float = 10.0) -> req
 
 
 def _wait_worker_ready(port: int, timeout: int) -> tuple[bool, str]:
-    """Attend que le worker soit démarré ET connecté (logged=True)."""
+    """
+    Attend que le worker soit demarre ET connecte (logged=True).
+    Le worker demarre Flask immediatement, puis connecte MT5 en background.
+    On attend donc la reponse HTTP d'abord, puis logged=True ensuite.
+    """
     deadline = time.time() + timeout
-    last_err = "Le worker n'a pas répondu à temps."
+    last_err = "Le worker n'a pas repondu a temps."
+    http_alive = False
+    last_log_t = time.time()
     while time.time() < deadline:
         try:
             res = _worker_get(port, "/health", timeout=3.0)
             if res.ok:
                 data = res.json()
+                if not http_alive:
+                    http_alive = True
+                    log.info("Worker port %d: Flask actif, connexion broker en cours...", port)
                 if data.get("logged"):
                     return True, ""
+                # Affiche la progression toutes les 15s
+                if time.time() - last_log_t > 15:
+                    last_log_t = time.time()
+                    last_err_tmp = data.get("last_error", "")
+                    remaining = int(deadline - time.time())
+                    log.info("Worker port %d: connexion broker en cours (timeout dans %ds)%s",
+                             port, remaining, f" | erreur: {last_err_tmp}" if last_err_tmp else "")
                 if data.get("last_error"):
                     last_err = data["last_error"]
         except Exception:
             pass
         time.sleep(1.0)
-    return False, last_err
+    if not http_alive:
+        return False, "Le worker n'a pas demarré (Flask inaccessible) — verifier Python/port."
+    return False, f"Connexion broker MT5 timeout apres {timeout}s. Derniere erreur: {last_err}"
 
 
 # Sérialise les démarrages à froid : lancer 20 terminaux d'un coup provoque des
