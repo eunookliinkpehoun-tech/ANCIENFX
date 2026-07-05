@@ -72,8 +72,8 @@ def _check_secret() -> Optional[tuple]:
 
 
 # ── Connexion MT5 (propre à cette instance de terminal) ─────────────────────────
-INIT_ATTEMPTS   = 4
-INIT_TIMEOUT_MS = 60_000   # handshake IPC (ms)
+INIT_ATTEMPTS   = 6
+INIT_TIMEOUT_MS = 8_000    # handshake IPC (ms) — court pour liberer le GIL vite
 LOGIN_ATTEMPTS  = 3
 LOGIN_WAIT_S    = 10        # attente entre tentatives de login
 
@@ -107,8 +107,10 @@ def _initialize_and_login() -> tuple[bool, str]:
                      attempt, INIT_ATTEMPTS)
             break
         last_code, last_msg = mt5.last_error()
-        wait = min(2.0 * attempt, 8.0)
-        log.warning("initialize() tentative %d/%d echouee (code %s: %s). Retry dans %.1fs.",
+        # -10005 = IPC timeout : le terminal n'est pas encore pret.
+        # On lui laisse plus de temps (15s) avant de reessayer.
+        wait = 15.0 if last_code == -10005 else min(2.0 * attempt, 8.0)
+        log.warning("initialize() tentative %d/%d echouee (code %s: %s). Retry dans %.0fs.",
                     attempt, INIT_ATTEMPTS, last_code, last_msg, wait)
         try:
             mt5.shutdown()
@@ -609,6 +611,11 @@ def _init_in_background():
     retente la connexion automatiquement jusqu'a succes ou arret explicite.
     Cela permet au manager de lire l'erreur exacte au lieu de voir "process mort".
     """
+    # Attendre que Flask soit demarre et lie au port avant de bloquer le GIL
+    # avec mt5.initialize(). Sans ce delai, mt5.initialize() (meme dans un thread)
+    # bloque le GIL assez longtemps pour que Flask ne puisse pas repondre au
+    # premier ping du manager -> le manager voit "Flask inaccessible".
+    time.sleep(2)
     log.info("Init MT5 en arriere-plan pour %s@%s ...", ARGS.login, ARGS.server)
     attempt = 0
     while True:
