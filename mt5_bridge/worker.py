@@ -3,18 +3,23 @@ ANCIENFX - MT5 Worker
 =====================
 UN worker = UN processus Python = UNE instance de terminal MT5 = UN compte.
 
-Pattern: le terminal MT5 doit DEJA ETRE OUVERT ET CONNECTE sur le VPS.
-Le worker s'y attache via mt5.initialize(path=...) SANS passer de credentials.
-Inspire de github.com/therichkidcl-spec/mcp-mt5.
+Strategie de connexion (la seule fiable avec les brokers comme XMGlobal) :
+  1. Lancer terminal64.exe avec /login: /password: /server: /portable en subprocess
+  2. Attendre que le processus soit stable (3-5s)
+  3. Appeler mt5.initialize(path=...) SANS passer de credentials a Python
+  4. Verifier account_info() pour confirmer la connexion
 
-Lancement (fait par le manager, pas a la main) :
-  python worker.py --login 123 \
-      --terminal "C:\\ancienfx_mt5\\123\\terminal64.exe" \
-      --port 9101 --secret mysecret
+Pourquoi pas mt5.initialize(login=..., portable=True) ?
+  Cette forme force MT5 a relancer une connexion broker depuis Python, ce qui
+  echoue avec -10005 sur la plupart des brokers car le canal IPC n'est pas pret.
+  En lancant le terminal avec ses propres arguments CLI, il gere lui-meme la
+  connexion broker, et Python s'y attache une fois qu'il est connecte.
 """
 
 import argparse
 import logging
+import os
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -31,12 +36,12 @@ except ImportError:
 
 # ── Arguments ────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument("--login", required=True)
-parser.add_argument("--password", default="")   # garde pour compat, non utilise
-parser.add_argument("--server", default="")     # garde pour compat, non utilise
-parser.add_argument("--terminal", required=True, help="Chemin vers terminal64.exe de CETTE instance")
-parser.add_argument("--port", type=int, required=True)
-parser.add_argument("--secret", default="")
+parser.add_argument("--login",    required=True)
+parser.add_argument("--password", required=True)
+parser.add_argument("--server",   required=True)
+parser.add_argument("--terminal", required=True, help="Chemin vers terminal64.exe")
+parser.add_argument("--port",     type=int, required=True)
+parser.add_argument("--secret",   default="")
 ARGS = parser.parse_args()
 
 logging.basicConfig(
@@ -48,73 +53,126 @@ log = logging.getLogger(f"worker-{ARGS.login}")
 
 app = Flask(__name__)
 
-# ── État du worker ─────────────────────────────────────────────────────────────
+# ── Etat du worker ─────────────────────────────────────────────────────────────
 _state = {
-    "logged": False,
-    "last_error": "",
-    "account": None,      # dernier snapshot du compte
-    "last_sync": 0.0,
+    "logged":      False,
+    "last_error":  "",
+    "account":     None,
+    "last_sync":   0.0,
     "initialized": False,
 }
 _lock = threading.Lock()
 
+# ── Constantes de connexion ───────────────────────────────────────────────────
+# Temps d'attente apres le lancement du terminal avant la premiere tentative IPC
+TERMINAL_BOOT_WAIT = 6       # secondes
+# Nombre de tentatives d'attachement IPC apres le boot
+ATTACH_ATTEMPTS    = 10
+ATTACH_WAIT_S      = 8       # secondes entre tentatives
 
-# ── Sécurité ────────────────────────────────────────────────────────────────────
+
+# ── Securite ────────────────────────────────────────────────────────────────────
 def _check_secret() -> Optional[tuple]:
     if ARGS.secret:
         if request.headers.get("X-Bridge-Secret", "") != ARGS.secret:
-            return jsonify({"ok": False, "message": "Non autorisé."}), 401
+            return jsonify({"ok": False, "message": "Non autorise."}), 401
     return None
 
 
-# ── Connexion MT5 ───────────────────────────────────────────────────────────────
-# Pattern inspire de therichkidcl-spec/mcp-mt5 :
-# Le terminal doit DEJA ETRE OUVERT ET CONNECTE sur le VPS.
-# Le worker s'y attache simplement via mt5.initialize(path=...) SANS login/password.
-# C'est la seule methode fiable — passer login= ou appeler mt5.login() apres
-# un initialize() en mode portable echoue avec -10005 sur la plupart des brokers.
-ATTACH_ATTEMPTS = 8
-ATTACH_WAIT_S   = 5   # attente entre tentatives d'attachement
-
-
-def _initialize_and_login() -> tuple[bool, str]:
+# ── Lancement du terminal MT5 via CLI ─────────────────────────────────────────
+def _launch_terminal() -> Optional[subprocess.Popen]:
     """
-    Attache le processus Python au terminal MT5 DEJA OUVERT sur le VPS.
-    Aucun login/password n'est passe : le terminal est deja authentifie.
-    Si le terminal n'est pas encore demarre, on retente toutes les 5s.
+    Lance terminal64.exe avec les arguments de connexion natifs de MT5.
+    Le terminal gere lui-meme la connexion broker — beaucoup plus fiable
+    que de passer login/password a mt5.initialize() via Python.
+
+    Arguments CLI de MetaTrader 5 (documentes par MetaQuotes) :
+      /portable    : mode portable (donnees dans le dossier du terminal)
+      /login:N     : numero de compte
+      /password:X  : mot de passe
+      /server:S    : nom du serveur broker
+      /skipupdate  : ne pas checker les mises a jour au demarrage
+    """
+    terminal = ARGS.terminal
+    if not os.path.exists(terminal):
+        log.error("terminal64.exe introuvable: %s", terminal)
+        return None
+
+    cmd = [
+        terminal,
+        "/portable",
+        f"/login:{ARGS.login}",
+        f"/password:{ARGS.password}",
+        f"/server:{ARGS.server}",
+        "/skipupdate",
+    ]
+    log.info("Lancement terminal: %s /login:%s /server:%s", terminal, ARGS.login, ARGS.server)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log.info("Terminal PID=%d lance. Attente %ds pour le boot...", proc.pid, TERMINAL_BOOT_WAIT)
+        return proc
+    except Exception as exc:
+        log.error("Impossible de lancer le terminal: %s", exc)
+        return None
+
+
+# ── Attachement IPC a un terminal deja en cours ───────────────────────────────
+def _attach_to_terminal() -> tuple[bool, str]:
+    """
+    S'attache au terminal via mt5.initialize(path=...) SANS passer de credentials.
+    Le terminal a deja ete lance par _launch_terminal() et s'est connecte au broker.
+    On attend que account_info() retourne le bon compte.
     """
     if not MT5_AVAILABLE:
         return False, "MetaTrader5 non disponible sur ce systeme."
 
     last_code, last_msg = 0, "inconnu"
+
     for attempt in range(1, ATTACH_ATTEMPTS + 1):
-        # initialize() SANS portable=True, SANS login/password/server
-        # On s'attache au terminal deja en cours d'execution identifie par path=
         ok = mt5.initialize(path=ARGS.terminal)
         if ok:
             info = mt5.account_info()
             if info is None:
                 last_code, last_msg = mt5.last_error()
-                log.warning("initialize() ok mais account_info() vide — terminal pas encore connecte au broker? (code %s: %s)", last_code, last_msg)
+                log.info("initialize() ok, account_info() pas encore dispo (tentative %d/%d, code %s). Retry %ds...",
+                         attempt, ATTACH_ATTEMPTS, last_code, ATTACH_WAIT_S)
                 mt5.shutdown()
                 time.sleep(ATTACH_WAIT_S)
                 continue
-            # Verifier que le terminal est connecte au bon compte
+
             if str(info.login) != str(ARGS.login):
-                log.warning("Compte inattendu: terminal connecte a %s, attendu %s. Tentative %d/%d.",
+                log.warning("Compte inattendu: terminal=%s attendu=%s (tentative %d/%d).",
                             info.login, ARGS.login, attempt, ATTACH_ATTEMPTS)
                 mt5.shutdown()
                 time.sleep(ATTACH_WAIT_S)
                 continue
+
+            is_demo = info.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO
             with _lock:
                 _state["initialized"] = True
                 _state["logged"]      = True
                 _state["last_error"]  = ""
-            log.info("Attache au compte %s@%s (balance=%.2f %s)",
-                     info.login, info.server, info.balance, info.currency)
+                _state["account"] = {
+                    "login":       str(info.login),
+                    "server":      info.server,
+                    "broker":      info.company,
+                    "accountType": "DEMO" if is_demo else "REEL",
+                    "leverage":    info.leverage,
+                    "isDemo":      is_demo,
+                    "balance":     round(info.balance, 2),
+                    "equity":      round(info.equity, 2),
+                    "freeMargin":  round(info.margin_free, 2),
+                    "dailyProfit": round(info.profit, 2),
+                    "currency":    info.currency,
+                }
+            log.info("Connecte: %s@%s | %s | balance=%.2f %s",
+                     info.login, info.server,
+                     "DEMO" if is_demo else "REEL",
+                     info.balance, info.currency)
             return True, ""
+
         last_code, last_msg = mt5.last_error()
-        log.warning("initialize() tentative %d/%d echouee (code %s: %s). Retry dans %ds.",
+        log.warning("initialize() tentative %d/%d echouee (code %s: %s). Retry %ds...",
                     attempt, ATTACH_ATTEMPTS, last_code, last_msg, ATTACH_WAIT_S)
         try:
             mt5.shutdown()
@@ -122,9 +180,34 @@ def _initialize_and_login() -> tuple[bool, str]:
             pass
         time.sleep(ATTACH_WAIT_S)
 
+    err = f"Attachement IPC echoue apres {ATTACH_ATTEMPTS} tentatives (code {last_code}: {last_msg})"
     with _lock:
-        _state["last_error"] = f"initialize echoue apres {ATTACH_ATTEMPTS} tentatives (code {last_code}: {last_msg})"
-    return False, _state["last_error"]
+        _state["last_error"] = err
+    return False, err
+
+
+def _initialize_and_login() -> tuple[bool, str]:
+    """
+    Point d'entree principal : lance le terminal avec ses credentials,
+    attend le boot, puis s'y attache via IPC.
+    """
+    # Etape 1 : lancer le terminal avec login/password/server en arguments CLI
+    proc = _launch_terminal()
+    if proc is None:
+        return False, f"Impossible de lancer {ARGS.terminal}"
+
+    # Etape 2 : attendre que le terminal soit demarre et connecte au broker
+    time.sleep(TERMINAL_BOOT_WAIT)
+
+    # Etape 3 : s'attacher via IPC
+    ok, err = _attach_to_terminal()
+    if not ok:
+        # Tuer le terminal si l'attachement echoue pour ne pas laisser un zombie
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    return ok, err
 
 
 def _account_snapshot() -> Optional[dict]:
@@ -135,22 +218,22 @@ def _account_snapshot() -> Optional[dict]:
         return None
     is_demo = info.trade_mode == mt5.ACCOUNT_TRADE_MODE_DEMO
     return {
-        "login": str(info.login),
-        "server": ARGS.server,
-        "broker": info.company,
-        "accountType": "DEMO" if is_demo else "RÉEL",
-        "leverage": info.leverage,
-        "isDemo": is_demo,
-        "balance": round(info.balance, 2),
-        "equity": round(info.equity, 2),
-        "freeMargin": round(info.margin_free, 2),
+        "login":       str(info.login),
+        "server":      ARGS.server,
+        "broker":      info.company,
+        "accountType": "DEMO" if is_demo else "REEL",
+        "leverage":    info.leverage,
+        "isDemo":      is_demo,
+        "balance":     round(info.balance, 2),
+        "equity":      round(info.equity, 2),
+        "freeMargin":  round(info.margin_free, 2),
         "dailyProfit": round(info.profit, 2),
-        "currency": info.currency,
+        "currency":    info.currency,
     }
 
 
 def _resolve_symbol(raw: str) -> Optional[str]:
-    """Résolution du suffixe: EURUSDm → EURUSD, etc. (propre à ce broker)."""
+    """Resolution du suffixe: EURUSDm -> EURUSD, etc."""
     if not MT5_AVAILABLE:
         return raw
     if mt5.symbol_info(raw) is not None:
@@ -162,451 +245,221 @@ def _resolve_symbol(raw: str) -> Optional[str]:
     return None
 
 
-# ── Routes HTTP (appelées par le manager uniquement) ────────────────────────────
-@app.route("/health", methods=["GET"])
+# ── Sync auto ─────────────────────────────────────────────────────────────────
+def _auto_sync():
+    while True:
+        time.sleep(30)
+        with _lock:
+            if not _state["logged"]:
+                continue
+        try:
+            snap = _account_snapshot()
+            if snap:
+                with _lock:
+                    _state["account"]   = snap
+                    _state["last_sync"] = time.time()
+        except Exception as exc:
+            log.warning("auto_sync error: %s", exc)
+
+
+# ── Routes Flask ─────────────────────────────────────────────────────────────
+
+@app.route("/health")
 def health():
     with _lock:
         return jsonify({
-            "ok": True,
-            "login": ARGS.login,
-            "server": ARGS.server,
-            "logged": _state["logged"],
+            "ok":          _state["logged"],
+            "logged":      _state["logged"],
             "initialized": _state["initialized"],
-            "last_error": _state["last_error"],
-            "last_sync": _state["last_sync"],
+            "last_error":  _state["last_error"],
         })
 
 
-@app.route("/account", methods=["GET"])
+@app.route("/account")
 def account():
-    guard = _check_secret()
-    if guard:
-        return guard
+    err = _check_secret()
+    if err:
+        return err
+    with _lock:
+        if not _state["logged"]:
+            return jsonify({"ok": False, "message": _state["last_error"] or "Non connecte."}), 503
     snap = _account_snapshot()
     if snap is None:
-        with _lock:
-            return jsonify({"ok": False, "message": _state["last_error"] or "Compte non lisible."}), 503
+        return jsonify({"ok": False, "message": "account_info() indisponible."}), 503
+    return jsonify({"ok": True, **snap})
+
+
+@app.route("/tick/<symbol>")
+def tick(symbol: str):
+    err = _check_secret()
+    if err:
+        return err
     with _lock:
-        _state["account"] = snap
-        _state["last_sync"] = time.time()
-    return jsonify({"ok": True, "account": snap})
+        if not _state["logged"]:
+            return jsonify({"ok": False, "message": "Non connecte."}), 503
+    resolved = _resolve_symbol(symbol)
+    if resolved is None:
+        return jsonify({"ok": False, "message": f"Symbole {symbol} introuvable."}), 404
+    t = mt5.symbol_info_tick(resolved)
+    if t is None:
+        return jsonify({"ok": False, "message": f"Pas de tick pour {resolved}."}), 404
+    return jsonify({"ok": True, "symbol": resolved, "bid": t.bid, "ask": t.ask, "time": t.time})
 
 
-@app.route("/positions", methods=["GET"])
+@app.route("/positions")
 def positions():
-    guard = _check_secret()
-    if guard:
-        return guard
-    if not MT5_AVAILABLE:
-        return jsonify({"ok": True, "positions": []})
+    err = _check_secret()
+    if err:
+        return err
+    with _lock:
+        if not _state["logged"]:
+            return jsonify({"ok": False, "message": "Non connecte."}), 503
     raw = mt5.positions_get()
+    if raw is None:
+        raw = []
     result = []
-    if raw:
-        for p in raw:
-            result.append({
-                "ticket": p.ticket,
-                "symbol": p.symbol,
-                "type": "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL",
-                "volume": p.volume,
-                "openPrice": round(p.price_open, 5),
-                "sl": round(p.sl, 5),
-                "tp": round(p.tp, 5),
-                "profit": round(p.profit, 2),
-                "swap": round(p.swap, 2),
-                "comment": p.comment,
-                "openTime": datetime.fromtimestamp(p.time, tz=timezone.utc).isoformat(),
-            })
+    for p in raw:
+        result.append({
+            "ticket":     p.ticket,
+            "symbol":     p.symbol,
+            "type":       "BUY" if p.type == 0 else "SELL",
+            "volume":     p.volume,
+            "openPrice":  p.price_open,
+            "currentPrice": p.price_current,
+            "profit":     round(p.profit, 2),
+            "swap":       round(p.swap, 2),
+            "comment":    p.comment,
+            "magic":      p.magic,
+            "openTime":   datetime.fromtimestamp(p.time, tz=timezone.utc).isoformat(),
+        })
     return jsonify({"ok": True, "positions": result})
 
 
-@app.route("/history", methods=["POST"])
-def history():
-    guard = _check_secret()
-    if guard:
-        return guard
-    days = int((request.json or {}).get("days", 30))
-    if not MT5_AVAILABLE:
-        return jsonify({"ok": True, "deals": []})
-    from_ts = int(time.time() - days * 86400)
-    to_ts = int(time.time()) + 60
-    deals = mt5.history_deals_get(from_ts, to_ts)
-    result = []
-    if deals:
-        for d in deals:
-            if d.profit == 0 and d.entry == mt5.DEAL_ENTRY_IN:
-                continue
-            result.append({
-                "ticket": d.ticket,
-                "symbol": d.symbol,
-                "type": "BUY" if d.type == mt5.DEAL_TYPE_BUY else "SELL",
-                "volume": d.volume,
-                "price": round(d.price, 5),
-                "profit": round(d.profit, 2),
-                "commission": round(d.commission, 2),
-                "swap": round(d.swap, 2),
-                "comment": d.comment,
-                "time": datetime.fromtimestamp(d.time, tz=timezone.utc).isoformat(),
-            })
-    return jsonify({"ok": True, "deals": result})
-
-
-@app.route("/symbol_info", methods=["POST"])
-def symbol_info_route():
-    guard = _check_secret()
-    if guard:
-        return guard
-    symbol = str((request.json or {}).get("symbol", "")).strip()
-    if not symbol:
-        return jsonify({"ok": False, "message": "symbol obligatoire."}), 400
-    resolved = _resolve_symbol(symbol)
-    if resolved is None:
-        return jsonify({"ok": False, "message": f"Symbole '{symbol}' introuvable."}), 404
-    info = mt5.symbol_info(resolved) if MT5_AVAILABLE else None
-    return jsonify({
-        "ok": True,
-        "original": symbol,
-        "resolved": resolved,
-        "info": {
-            "bid": round(info.bid, 5),
-            "ask": round(info.ask, 5),
-            "spread": info.spread,
-            "digits": info.digits,
-            "volume_min": info.volume_min,
-            "volume_step": info.volume_step,
-        } if info else None,
-    })
-
-
-def _ensure_symbol_ready(symbol: str) -> Optional[str]:
-    """Résout + rend le symbole visible dans le Market Watch avant de trader."""
-    resolved = _resolve_symbol(symbol)
-    if resolved is None:
-        return None
-    info = mt5.symbol_info(resolved)
-    if info is None:
-        return None
-    if not info.visible:
-        mt5.symbol_select(resolved, True)
-        time.sleep(0.05)
-    return resolved
-
-
-def _filling_mode(symbol: str):
-    """Détermine le mode de remplissage supporté par le symbole/broker."""
-    info = mt5.symbol_info(symbol)
-    if info is not None:
-        mode = info.filling_mode
-        if mode & 1:  # SYMBOL_FILLING_FOK
-            return mt5.ORDER_FILLING_FOK
-        if mode & 2:  # SYMBOL_FILLING_IOC
-            return mt5.ORDER_FILLING_IOC
-    return mt5.ORDER_FILLING_RETURN
-
-
-@app.route("/open", methods=["POST"])
-def open_position():
-    """
-    Ouvre une position marché.
-    Body: {symbol, type: BUY|SELL, volume, sl?, tp?, magic?, comment?, deviation?}
-    """
-    guard = _check_secret()
-    if guard:
-        return guard
-    if not MT5_AVAILABLE:
-        return jsonify({"ok": False, "message": "MT5 indisponible."}), 503
-
+@app.route("/order", methods=["POST"])
+def order():
+    err = _check_secret()
+    if err:
+        return err
+    with _lock:
+        if not _state["logged"]:
+            return jsonify({"ok": False, "message": "Non connecte."}), 503
     data = request.json or {}
-    raw_symbol = str(data.get("symbol", "")).strip()
-    side = str(data.get("type", "")).upper()
-    volume = float(data.get("volume", 0))
-    sl = float(data.get("sl", 0) or 0)
-    tp = float(data.get("tp", 0) or 0)
-    magic = int(data.get("magic", 0) or 0)
-    comment = str(data.get("comment", "ANCIENFX"))[:31]
-    deviation = int(data.get("deviation", 20))
+    symbol  = data.get("symbol", "")
+    side    = data.get("side", "BUY").upper()
+    volume  = float(data.get("volume", 0.01))
+    sl      = float(data.get("sl", 0.0))
+    tp      = float(data.get("tp", 0.0))
+    comment = data.get("comment", "ANCIENFX")
+    magic   = int(data.get("magic", 0))
 
-    if not raw_symbol or side not in ("BUY", "SELL") or volume <= 0:
-        return jsonify({"ok": False, "message": "symbol, type (BUY/SELL) et volume>0 requis."}), 400
-
-    symbol = _ensure_symbol_ready(raw_symbol)
-    if symbol is None:
-        return jsonify({"ok": False, "message": f"Symbole '{raw_symbol}' indisponible sur ce broker."}), 404
-
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        return jsonify({"ok": False, "message": "Prix indisponible."}), 503
+    resolved = _resolve_symbol(symbol)
+    if resolved is None:
+        return jsonify({"ok": False, "message": f"Symbole {symbol} introuvable."}), 404
 
     order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
-    price = tick.ask if side == "BUY" else tick.bid
-
-    # Normalise le volume aux contraintes du symbole
-    info = mt5.symbol_info(symbol)
-    step = info.volume_step or 0.01
-    volume = max(info.volume_min, min(info.volume_max, round(volume / step) * step))
-    volume = round(volume, 2)
+    t = mt5.symbol_info_tick(resolved)
+    if t is None:
+        return jsonify({"ok": False, "message": f"Pas de prix pour {resolved}."}), 503
+    price = t.ask if side == "BUY" else t.bid
 
     req = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": volume,
-        "type": order_type,
-        "price": price,
-        "deviation": deviation,
-        "magic": magic,
-        "comment": comment,
+        "action":   mt5.TRADE_ACTION_DEAL,
+        "symbol":   resolved,
+        "volume":   volume,
+        "type":     order_type,
+        "price":    price,
+        "sl":       sl,
+        "tp":       tp,
+        "deviation": 20,
+        "magic":    magic,
+        "comment":  comment,
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": _filling_mode(symbol),
+        "type_filling": mt5.ORDER_FILLING_IOC,
     }
-    if sl > 0:
-        req["sl"] = sl
-    if tp > 0:
-        req["tp"] = tp
-
     result = mt5.order_send(req)
-    if result is None:
-        code, msg = mt5.last_error()
-        return jsonify({"ok": False, "message": f"order_send nul (code {code}): {msg}"}), 502
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        return jsonify({"ok": False, "message": f"Ordre rejeté (retcode {result.retcode}): {result.comment}", "retcode": result.retcode}), 502
-
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        code = result.retcode if result else -1
+        msg  = result.comment if result else "Pas de reponse"
+        return jsonify({"ok": False, "message": f"Ordre refuse: {msg} (code {code})"}), 400
     return jsonify({
-        "ok": True,
+        "ok":     True,
         "ticket": result.order,
-        "position": getattr(result, "position", result.order),
-        "volume": volume,
-        "price": round(result.price, 5),
-        "symbol": symbol,
+        "price":  result.price,
+        "volume": result.volume,
     })
 
 
 @app.route("/close", methods=["POST"])
-def close_position():
-    """
-    Ferme une position par ticket (partiellement si volume fourni).
-    Body: {ticket, volume?, deviation?}
-    """
-    guard = _check_secret()
-    if guard:
-        return guard
-    if not MT5_AVAILABLE:
-        return jsonify({"ok": False, "message": "MT5 indisponible."}), 503
-
-    data = request.json or {}
-    ticket = int(data.get("ticket", 0) or 0)
-    deviation = int(data.get("deviation", 20))
-    if ticket <= 0:
-        return jsonify({"ok": False, "message": "ticket requis."}), 400
-
-    pos_list = mt5.positions_get(ticket=ticket)
-    if not pos_list:
-        # Déjà fermée → succès idempotent
-        return jsonify({"ok": True, "already_closed": True})
-    pos = pos_list[0]
-
-    volume = float(data.get("volume", pos.volume) or pos.volume)
-    volume = min(volume, pos.volume)
-
-    tick = mt5.symbol_info_tick(pos.symbol)
-    if tick is None:
-        return jsonify({"ok": False, "message": "Prix indisponible."}), 503
-
-    # Sens inverse pour clôturer
-    if pos.type == mt5.ORDER_TYPE_BUY:
-        close_type = mt5.ORDER_TYPE_SELL
-        price = tick.bid
-    else:
-        close_type = mt5.ORDER_TYPE_BUY
-        price = tick.ask
-
+def close():
+    err = _check_secret()
+    if err:
+        return err
+    with _lock:
+        if not _state["logged"]:
+            return jsonify({"ok": False, "message": "Non connecte."}), 503
+    data   = request.json or {}
+    ticket = int(data.get("ticket", 0))
+    positions = mt5.positions_get(ticket=ticket)
+    if not positions:
+        return jsonify({"ok": False, "message": f"Position {ticket} introuvable."}), 404
+    p = positions[0]
+    close_type = mt5.ORDER_TYPE_SELL if p.type == 0 else mt5.ORDER_TYPE_BUY
+    t = mt5.symbol_info_tick(p.symbol)
+    if t is None:
+        return jsonify({"ok": False, "message": f"Pas de prix pour {p.symbol}."}), 503
+    price = t.bid if p.type == 0 else t.ask
     req = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": pos.symbol,
-        "volume": round(volume, 2),
-        "type": close_type,
-        "position": ticket,
-        "price": price,
-        "deviation": deviation,
-        "magic": pos.magic,
-        "comment": "ANCIENFX close",
+        "action":    mt5.TRADE_ACTION_DEAL,
+        "symbol":    p.symbol,
+        "volume":    p.volume,
+        "type":      close_type,
+        "position":  ticket,
+        "price":     price,
+        "deviation": 20,
+        "magic":     p.magic,
+        "comment":   "ANCIENFX-CLOSE",
         "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": _filling_mode(pos.symbol),
-    }
-    result = mt5.order_send(req)
-    if result is None:
-        code, msg = mt5.last_error()
-        return jsonify({"ok": False, "message": f"order_send nul (code {code}): {msg}"}), 502
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        return jsonify({"ok": False, "message": f"Clôture rejetée (retcode {result.retcode}): {result.comment}", "retcode": result.retcode}), 502
-
-    return jsonify({"ok": True, "ticket": ticket, "closed_volume": round(volume, 2)})
-
-
-@app.route("/modify", methods=["POST"])
-def modify_position():
-    """
-    Modifie le SL/TP d'une position.
-    Body: {ticket, sl?, tp?}
-    """
-    guard = _check_secret()
-    if guard:
-        return guard
-    if not MT5_AVAILABLE:
-        return jsonify({"ok": False, "message": "MT5 indisponible."}), 503
-
-    data = request.json or {}
-    ticket = int(data.get("ticket", 0) or 0)
-    if ticket <= 0:
-        return jsonify({"ok": False, "message": "ticket requis."}), 400
-
-    pos_list = mt5.positions_get(ticket=ticket)
-    if not pos_list:
-        return jsonify({"ok": False, "message": "Position introuvable."}), 404
-    pos = pos_list[0]
-
-    sl = float(data.get("sl", pos.sl) or 0)
-    tp = float(data.get("tp", pos.tp) or 0)
-
-    req = {
-        "action": mt5.TRADE_ACTION_SLTP,
-        "symbol": pos.symbol,
-        "position": ticket,
-        "sl": sl,
-        "tp": tp,
+        "type_filling": mt5.ORDER_FILLING_IOC,
     }
     result = mt5.order_send(req)
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-        rc = result.retcode if result else "nul"
-        return jsonify({"ok": False, "message": f"Modification SL/TP rejetée (retcode {rc})."}), 502
-
-    return jsonify({"ok": True, "ticket": ticket, "sl": sl, "tp": tp})
-
-
-@app.route("/close_all", methods=["POST"])
-def close_all():
-    """Ferme toutes les positions (optionnellement filtrées par magic). Body: {magic?}"""
-    guard = _check_secret()
-    if guard:
-        return guard
-    if not MT5_AVAILABLE:
-        return jsonify({"ok": True, "closed": 0})
-
-    data = request.json or {}
-    magic_filter = data.get("magic")
-    positions = mt5.positions_get() or []
-    closed = 0
-    for pos in positions:
-        if magic_filter is not None and pos.magic != int(magic_filter):
-            continue
-        tick = mt5.symbol_info_tick(pos.symbol)
-        if tick is None:
-            continue
-        if pos.type == mt5.ORDER_TYPE_BUY:
-            close_type, price = mt5.ORDER_TYPE_SELL, tick.bid
-        else:
-            close_type, price = mt5.ORDER_TYPE_BUY, tick.ask
-        req = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": pos.symbol,
-            "volume": pos.volume,
-            "type": close_type,
-            "position": pos.ticket,
-            "price": price,
-            "deviation": 20,
-            "magic": pos.magic,
-            "comment": "ANCIENFX close_all",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": _filling_mode(pos.symbol),
-        }
-        res = mt5.order_send(req)
-        if res is not None and res.retcode == mt5.TRADE_RETCODE_DONE:
-            closed += 1
-    return jsonify({"ok": True, "closed": closed})
+        code = result.retcode if result else -1
+        msg  = result.comment if result else "Pas de reponse"
+        return jsonify({"ok": False, "message": f"Fermeture refusee: {msg} (code {code})"}), 400
+    return jsonify({"ok": True, "ticket": ticket, "closed": True})
 
 
-@app.route("/shutdown", methods=["POST"])
-def shutdown():
-    guard = _check_secret()
-    if guard:
-        return guard
-    log.info("Arrêt demandé.")
-    if MT5_AVAILABLE:
-        mt5.shutdown()
-    # Arrêt propre du serveur Flask
-    func = request.environ.get("werkzeug.server.shutdown")
-    if func:
-        func()
-    else:
-        # Fallback dur
-        threading.Timer(0.5, lambda: __import__("os")._exit(0)).start()
-    return jsonify({"ok": True})
-
-
-# ── Sync automatique local ──────────────────────────────────────────────────────
-def _auto_sync():
-    while True:
-        time.sleep(15)
-        if not MT5_AVAILABLE:
-            continue
-        try:
-            # Si la connexion est tombée, on retente
-            if mt5.account_info() is None:
-                ok, err = _initialize_and_login()
-                if not ok:
-                    with _lock:
-                        _state["logged"] = False
-                        _state["last_error"] = err
-                    log.warning("Reconnexion échouée: %s", err)
-                    continue
-            snap = _account_snapshot()
-            if snap:
-                with _lock:
-                    _state["account"] = snap
-                    _state["last_sync"] = time.time()
-                    _state["logged"] = True
-        except Exception as exc:
-            with _lock:
-                _state["last_error"] = str(exc)
-            log.warning("Auto-sync erreur: %s", exc)
-
-
-# ── Démarrage ────────────────────────────────────────────────────────────────────
-RECONNECT_INTERVAL = 30  # secondes entre les tentatives de reconnexion auto
+# ── Init en background + demarrage Flask ─────────────────────────────────────
+RECONNECT_INTERVAL = 60  # secondes entre tentatives si connexion initiale echoue
 
 
 def _init_in_background():
     """
-    Init MT5 en arriere-plan. Le worker NE QUITTE PAS si le login echoue :
-    il continue de repondre a /health (logged=False, last_error=...) et
-    retente la connexion automatiquement jusqu'a succes ou arret explicite.
-    Cela permet au manager de lire l'erreur exacte au lieu de voir "process mort".
+    Demarre le terminal et s'y attache.
+    Flask est deja demarre — le manager peut pinguer /health pendant ce temps.
+    Si la connexion echoue, on retente indefiniment : le worker ne quitte jamais.
     """
-    # Attendre que Flask soit demarre et lie au port avant de bloquer le GIL
-    # avec mt5.initialize(). Sans ce delai, mt5.initialize() (meme dans un thread)
-    # bloque le GIL assez longtemps pour que Flask ne puisse pas repondre au
-    # premier ping du manager -> le manager voit "Flask inaccessible".
+    # Delai pour laisser Flask binder le port et repondre au premier ping manager
     time.sleep(2)
-    log.info("Init MT5 en arriere-plan pour %s@%s ...", ARGS.login, ARGS.server)
     attempt = 0
     while True:
         attempt += 1
-        log.info("[background] Tentative de connexion #%d pour %s@%s", attempt, ARGS.login, ARGS.server)
+        log.info("[background] Tentative de connexion #%d pour %s@%s",
+                 attempt, ARGS.login, ARGS.server)
         ok, err = _initialize_and_login()
         if ok:
-            log.info("Connecte au compte %s@%s", ARGS.login, ARGS.server)
             return
         with _lock:
             _state["last_error"] = err
-        log.error("[background] Connexion echouee (tentative %d): %s", attempt, err)
-        log.info("[background] Nouvelle tentative dans %ds...", RECONNECT_INTERVAL)
+        log.error("[background] Echec connexion #%d: %s. Retry dans %ds...",
+                  attempt, err, RECONNECT_INTERVAL)
         time.sleep(RECONNECT_INTERVAL)
 
 
 if __name__ == "__main__":
-    log.info("Demarrage worker — terminal=%s port=%d", ARGS.terminal, ARGS.port)
+    log.info("Demarrage worker — login=%s server=%s terminal=%s port=%d",
+             ARGS.login, ARGS.server, ARGS.terminal, ARGS.port)
 
-    # IMPORTANT : Flask demarre AVANT l'init MT5 (en background).
-    # Sans ca, le manager voit "pas de reponse" pendant toute la connexion broker
-    # et tue le worker avant meme qu'il ait eu le temps de se connecter.
     threading.Thread(target=_init_in_background, daemon=True).start()
     threading.Thread(target=_auto_sync, daemon=True).start()
     app.run(host="127.0.0.1", port=ARGS.port, debug=False, threaded=True)

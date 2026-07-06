@@ -162,11 +162,7 @@ def _wait_worker_ready(port: int, timeout: int) -> tuple[bool, str]:
                 last_err = final_err
     except Exception:
         pass
-    return False, (
-        f"Le terminal MT5 n'est pas connecte au compte {port} (timeout {timeout}s). "
-        f"Assurez-vous que MetaTrader 5 est ouvert et connecte sur le VPS avant de cliquer Connecter. "
-        f"Erreur: {last_err}"
-    )
+    return False, f"Connexion MT5 timeout apres {timeout}s. Erreur: {last_err}"
 
 
 # Sérialise les démarrages à froid : lancer 20 terminaux d'un coup provoque des
@@ -201,19 +197,21 @@ def _spawn_worker_locked(login: str, password: str, server: str) -> tuple[bool, 
         return False, str(exc), None
 
     # 3) Lancement du sous-processus worker
-    # IMPORTANT: on ne passe plus password/server au worker.
-    # Le worker s'attache au terminal DEJA OUVERT — pas de mt5.login().
-    # L'utilisateur doit avoir ouvert et connecte le terminal MT5 manuellement.
+    # Le worker lance terminal64.exe avec /login: /password: /server: en CLI natif,
+    # attend 6s de boot, puis s'attache via mt5.initialize(path=...) sans passer
+    # de credentials a Python (evite le -10005 IPC timeout).
     cmd = [
         PYTHON_EXE, _WORKER_SCRIPT,
-        "--login", str(login),
+        "--login",    str(login),
+        "--password", password,
+        "--server",   server,
         "--terminal", terminal_path,
-        "--port", str(port),
+        "--port",     str(port),
     ]
     if BRIDGE_SECRET:
         cmd += ["--secret", BRIDGE_SECRET]
 
-    log.info("Lancement worker %s (terminal=%s) sur port %d", login, terminal_path, port)
+    log.info("Lancement worker %s@%s sur port %d", login, server, port)
     log.info("  terminal: %s", terminal_path)
 
     # Log du worker dans un fichier dedie pour pouvoir diagnostiquer les erreurs MT5
