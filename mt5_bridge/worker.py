@@ -3,16 +3,12 @@ ANCIENFX - MT5 Worker
 =====================
 UN worker = UN processus Python = UNE instance de terminal MT5 = UN compte.
 
-C'est la brique qui permet la connexion SIMULTANÉE de plusieurs comptes.
-La librairie Python `MetaTrader5` ne peut piloter qu'UN terminal par processus.
-Pour connecter N comptes en même temps, on lance N workers, chacun attaché
-à sa propre copie portable du terminal MT5 (voir provision.py).
+Pattern: le terminal MT5 doit DEJA ETRE OUVERT ET CONNECTE sur le VPS.
+Le worker s'y attache via mt5.initialize(path=...) SANS passer de credentials.
+Inspire de github.com/therichkidcl-spec/mcp-mt5.
 
-Le manager (bridge.py) lance ce worker en sous-processus et communique
-avec lui via une petite API HTTP locale sur un port dédié.
-
-Lancement (fait par le manager, pas à la main) :
-  python worker.py --login 123 --password xxx --server Exness-MT5Trial9 \
+Lancement (fait par le manager, pas a la main) :
+  python worker.py --login 123 \
       --terminal "C:\\ancienfx_mt5\\123\\terminal64.exe" \
       --port 9101 --secret mysecret
 """
@@ -36,8 +32,8 @@ except ImportError:
 # ── Arguments ────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
 parser.add_argument("--login", required=True)
-parser.add_argument("--password", required=True)
-parser.add_argument("--server", required=True)
+parser.add_argument("--password", default="")   # garde pour compat, non utilise
+parser.add_argument("--server", default="")     # garde pour compat, non utilise
 parser.add_argument("--terminal", required=True, help="Chemin vers terminal64.exe de CETTE instance")
 parser.add_argument("--port", type=int, required=True)
 parser.add_argument("--secret", default="")
@@ -71,91 +67,64 @@ def _check_secret() -> Optional[tuple]:
     return None
 
 
-# ── Connexion MT5 (propre à cette instance de terminal) ─────────────────────────
-INIT_ATTEMPTS   = 6
-INIT_TIMEOUT_MS = 8_000    # handshake IPC (ms) — court pour liberer le GIL vite
-LOGIN_ATTEMPTS  = 3
-LOGIN_WAIT_S    = 10        # attente entre tentatives de login
+# ── Connexion MT5 ───────────────────────────────────────────────────────────────
+# Pattern inspire de therichkidcl-spec/mcp-mt5 :
+# Le terminal doit DEJA ETRE OUVERT ET CONNECTE sur le VPS.
+# Le worker s'y attache simplement via mt5.initialize(path=...) SANS login/password.
+# C'est la seule methode fiable — passer login= ou appeler mt5.login() apres
+# un initialize() en mode portable echoue avec -10005 sur la plupart des brokers.
+ATTACH_ATTEMPTS = 8
+ATTACH_WAIT_S   = 5   # attente entre tentatives d'attachement
 
 
 def _initialize_and_login() -> tuple[bool, str]:
     """
-    Connexion en DEUX ETAPES séparées — c'est la seule approche fiable :
-
-    Etape 1 — initialize() SANS login/password/server
-        On attache juste le processus Python au terminal portable.
-        Passer login= dans initialize() en mode portable est souvent ignoré
-        par MT5 (le terminal démarre mais reste non authentifié → Market Watch vide).
-
-    Etape 2 — mt5.login(login, password, server)
-        Une fois le terminal attaché, on authentifie séparément.
-        C'est ici que la connexion broker réelle se fait.
+    Attache le processus Python au terminal MT5 DEJA OUVERT sur le VPS.
+    Aucun login/password n'est passe : le terminal est deja authentifie.
+    Si le terminal n'est pas encore demarre, on retente toutes les 5s.
     """
     if not MT5_AVAILABLE:
         return False, "MetaTrader5 non disponible sur ce systeme."
 
-    # ── Etape 1 : attacher au terminal (sans login) ──────────────────────────
-    last_code, last_msg = 0, ""
-    for attempt in range(1, INIT_ATTEMPTS + 1):
-        ok = mt5.initialize(
-            path=ARGS.terminal,
-            portable=True,
-            timeout=INIT_TIMEOUT_MS,
-        )
-        if ok:
-            log.info("Terminal attache (tentative %d/%d) — passage au login broker...",
-                     attempt, INIT_ATTEMPTS)
-            break
-        last_code, last_msg = mt5.last_error()
-        # -10005 = IPC timeout : le terminal n'est pas encore pret.
-        # On lui laisse plus de temps (15s) avant de reessayer.
-        wait = 15.0 if last_code == -10005 else min(2.0 * attempt, 8.0)
-        log.warning("initialize() tentative %d/%d echouee (code %s: %s). Retry dans %.0fs.",
-                    attempt, INIT_ATTEMPTS, last_code, last_msg, wait)
-        try:
-            mt5.shutdown()
-        except Exception:
-            pass
-        time.sleep(wait)
-    else:
-        with _lock:
-            _state["last_error"] = f"initialize echoue (code {last_code}: {last_msg})"
-        return False, f"initialize() echoue apres {INIT_ATTEMPTS} tentatives: code {last_code}: {last_msg}"
-
-    with _lock:
-        _state["initialized"] = True
-
-    # ── Etape 2 : login broker séparé ────────────────────────────────────────
-    for attempt in range(1, LOGIN_ATTEMPTS + 1):
-        ok = mt5.login(
-            login=int(ARGS.login),
-            password=ARGS.password,
-            server=ARGS.server,
-            timeout=INIT_TIMEOUT_MS,
-        )
+    last_code, last_msg = 0, "inconnu"
+    for attempt in range(1, ATTACH_ATTEMPTS + 1):
+        # initialize() SANS portable=True, SANS login/password/server
+        # On s'attache au terminal deja en cours d'execution identifie par path=
+        ok = mt5.initialize(path=ARGS.terminal)
         if ok:
             info = mt5.account_info()
             if info is None:
                 last_code, last_msg = mt5.last_error()
-                log.warning("login() ok mais account_info() vide (code %s: %s).", last_code, last_msg)
-                time.sleep(LOGIN_WAIT_S)
+                log.warning("initialize() ok mais account_info() vide — terminal pas encore connecte au broker? (code %s: %s)", last_code, last_msg)
+                mt5.shutdown()
+                time.sleep(ATTACH_WAIT_S)
                 continue
+            # Verifier que le terminal est connecte au bon compte
             if str(info.login) != str(ARGS.login):
-                return False, f"Login inattendu: {info.login} != {ARGS.login}"
+                log.warning("Compte inattendu: terminal connecte a %s, attendu %s. Tentative %d/%d.",
+                            info.login, ARGS.login, attempt, ATTACH_ATTEMPTS)
+                mt5.shutdown()
+                time.sleep(ATTACH_WAIT_S)
+                continue
             with _lock:
+                _state["initialized"] = True
                 _state["logged"]      = True
                 _state["last_error"]  = ""
-            log.info("Connecte au compte %s@%s (balance=%.2f %s)",
+            log.info("Attache au compte %s@%s (balance=%.2f %s)",
                      info.login, info.server, info.balance, info.currency)
             return True, ""
         last_code, last_msg = mt5.last_error()
-        log.warning("login() tentative %d/%d echouee (code %s: %s). Retry dans %ds.",
-                    attempt, LOGIN_ATTEMPTS, last_code, last_msg, LOGIN_WAIT_S)
-        time.sleep(LOGIN_WAIT_S)
+        log.warning("initialize() tentative %d/%d echouee (code %s: %s). Retry dans %ds.",
+                    attempt, ATTACH_ATTEMPTS, last_code, last_msg, ATTACH_WAIT_S)
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        time.sleep(ATTACH_WAIT_S)
 
     with _lock:
-        _state["last_error"] = f"login echoue (code {last_code}: {last_msg})"
-    return False, f"mt5.login() echoue apres {LOGIN_ATTEMPTS} tentatives: code {last_code}: {last_msg}"
+        _state["last_error"] = f"initialize echoue apres {ATTACH_ATTEMPTS} tentatives (code {last_code}: {last_msg})"
+    return False, _state["last_error"]
 
 
 def _account_snapshot() -> Optional[dict]:
