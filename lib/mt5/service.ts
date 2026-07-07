@@ -1,25 +1,35 @@
 /**
- * ANCIENFX — MT5 Service (Next.js side)
- * ======================================
- * Toute communication avec le bridge Python passe par ce module.
- * Le bridge tourne sur le VPS Windows (mt5_bridge/bridge.py).
+ * ANCIENFX — MT5 Service (via MetaApi.cloud)
+ * ==========================================
+ * Toute la logique MT4/MT5 passe désormais par MetaApi.cloud (fini le bridge Python).
  *
- * Variable d'environnement requise (côté Vercel / .env) :
- *   MT5_BRIDGE_URL=http://127.0.0.1:8765   (ou URL du tunnel Cloudflare)
+ * Principes :
+ *  - Un compte utilisateur = un compte MetaTrader provisionné chez MetaApi.
+ *  - On déploie le compte pour lire ses infos, puis on peut le laisser déployé
+ *    (nécessaire pour la copie CopyFactory en temps réel).
+ *  - Les comptes NON FONCTIONNELS (identifiants invalides, broker injoignable)
+ *    sont supprimés immédiatement pour ne pas consommer de ressources MetaApi.
  *
- * Variable optionnelle :
- *   BRIDGE_SECRET=votre_secret_ici   (header X-Bridge-Secret)
+ * Variable d'environnement requise : METAAPI_TOKEN
  */
 
+import type MetatraderAccount from "metaapi.cloud-sdk/dist/metaApi/metatraderAccount"
+import { getMetaApi, isMetaApiConfigured, DEFAULT_REGION, APPLICATION } from "./metaapi"
+
 // ── Types publics ──────────────────────────────────────────────────────────────
+
+export type Mt5Platform = "mt4" | "mt5"
 
 export type Mt5ConnectPayload = {
   login: string
   password: string
   server: string
+  platform?: Mt5Platform
 }
 
 export type Mt5AccountInfo = {
+  /** Identifiant du compte chez MetaApi (à stocker en base pour les appels suivants). */
+  metaApiAccountId: string
   login: string
   server: string
   broker: string
@@ -61,340 +71,315 @@ export type Mt5Deal = {
 }
 
 export type BridgeHealth = {
-  mt5Available: boolean
-  terminalConnected: boolean
-  activeSessions: number
+  configured: boolean
+  provider: "metaapi"
+  region: string
   timestamp: string
 }
 
+// ── Constantes de temporisation ─────────────────────────────────────────────
+
+/** Délai max d'attente de connexion au broker avant de considérer le compte non fonctionnel. */
+const CONNECT_TIMEOUT_SECONDS = 90
+/** Délai max d'attente de synchronisation RPC. */
+const SYNC_TIMEOUT_SECONDS = 60
+
 // ── Helpers internes ───────────────────────────────────────────────────────────
 
-function bridgeUrl(): string | null {
-  return process.env.MT5_BRIDGE_URL?.replace(/\/$/, "") ?? null
+function toBuySell(type: string): "BUY" | "SELL" {
+  return /SELL/i.test(type) ? "SELL" : "BUY"
 }
 
-function bridgeHeaders(): HeadersInit {
-  const headers: Record<string, string> = { "Content-Type": "application/json" }
-  const secret = process.env.BRIDGE_SECRET
-  if (secret) headers["X-Bridge-Secret"] = secret
-  return headers
+function isDemoAccountType(type: string | undefined): boolean {
+  // ACCOUNT_TRADE_MODE_DEMO / ACCOUNT_TRADE_MODE_CONTEST => démo
+  return /DEMO|CONTEST/i.test(type ?? "")
 }
 
-/** fetch avec timeout de 10 secondes */
-async function bridgeFetch(path: string, body?: object): Promise<Response> {
-  const url = bridgeUrl()
-  if (!url) throw new Error("MT5_BRIDGE_URL non configuré.")
-
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), 10_000)
-
+/** Supprime un compte MetaApi sans jamais lever d'exception (nettoyage best-effort). */
+async function safeRemove(account: MetatraderAccount): Promise<void> {
   try {
-    return await fetch(`${url}${path}`, {
-      method: body !== undefined ? "POST" : "GET",
-      headers: bridgeHeaders(),
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-      signal: ctrl.signal,
-    })
-  } finally {
-    clearTimeout(timer)
+    await account.remove()
+  } catch (err) {
+    console.error("[v0] safeRemove failed:", err instanceof Error ? err.message : err)
   }
 }
 
-// ── Mock de développement (quand le bridge n'est pas actif) ───────────────────
+/**
+ * Récupère une connexion RPC synchronisée pour un compte donné.
+ * S'assure que le compte est déployé et connecté au broker.
+ * Lève une erreur si le compte est introuvable ou injoignable.
+ */
+async function getSyncedConnection(account: MetatraderAccount) {
+  if (account.state !== "DEPLOYED") {
+    await account.deploy()
+  }
+  await account.waitConnected(CONNECT_TIMEOUT_SECONDS)
 
-function mockAccount(payload: Mt5ConnectPayload): Mt5AccountInfo {
-  const isDemo = /demo/i.test(payload.server)
-  const seed = Number(payload.login.slice(-4)) || 1000
-  const balance = 10000 + seed * 1.27
+  const connection = account.getRPCConnection()
+  await connection.connect()
+  await connection.waitSynchronized(SYNC_TIMEOUT_SECONDS)
+  return connection
+}
 
-  return {
-    login: payload.login,
-    server: payload.server,
-    broker: isDemo ? "Exness (Demo)" : "Exness",
-    accountType: isDemo ? "DEMO" : "RÉEL",
-    leverage: 500,
-    isDemo,
-    balance: Math.round(balance * 100) / 100,
-    equity: Math.round((balance + 42.15) * 100) / 100,
-    freeMargin: Math.round((balance - 120) * 100) / 100,
-    dailyProfit: Math.round((seed % 300) * 100) / 100,
-    currency: "USD",
+/** Somme des profits des deals clôturés depuis minuit (UTC) pour un profit journalier approximatif. */
+async function computeDailyProfit(
+  connection: Awaited<ReturnType<typeof getSyncedConnection>>,
+): Promise<number> {
+  try {
+    const start = new Date()
+    start.setUTCHours(0, 0, 0, 0)
+    const end = new Date()
+    const result = await connection.getDealsByTimeRange(start, end)
+    const deals = result?.deals ?? []
+    const total = deals.reduce((acc, d) => acc + (d.profit ?? 0) + (d.swap ?? 0) + (d.commission ?? 0), 0)
+    return Math.round(total * 100) / 100
+  } catch {
+    return 0
   }
 }
 
 // ── API publique ───────────────────────────────────────────────────────────────
 
 /**
- * Vérifie si le bridge est joignable et si le terminal MT5 est connecté.
+ * Vérifie que MetaApi est configuré (token présent).
  */
 export async function checkBridgeHealth(): Promise<BridgeHealth | null> {
-  const url = bridgeUrl()
-  if (!url) return null
-
-  try {
-    const res = await bridgeFetch("/health")
-    if (!res.ok) return null
-    const data = await res.json()
-    return {
-      mt5Available: data.mt5_available,
-      terminalConnected: data.terminal_connected,
-      activeSessions: data.active_sessions,
-      timestamp: data.timestamp,
-    }
-  } catch {
-    return null
+  if (!isMetaApiConfigured()) return null
+  return {
+    configured: true,
+    provider: "metaapi",
+    region: DEFAULT_REGION,
+    timestamp: new Date().toISOString(),
   }
 }
 
 /**
- * Connecte un compte MT5 via le bridge.
- * Si le bridge est absent (dev local), retourne un compte mocké.
+ * Connecte (provisionne) un compte MT4/MT5 via MetaApi.
+ * - Crée le compte chez MetaApi, le déploie et attend la connexion broker.
+ * - En cas d'échec (identifiants invalides / broker injoignable), supprime le
+ *   compte pour ne pas consommer de ressources, puis lève une erreur.
  */
 export async function connectMt5Account(payload: Mt5ConnectPayload): Promise<Mt5AccountInfo> {
-  const url = bridgeUrl()
+  const login = payload.login.trim()
+  const server = payload.server.trim()
+  const platform: Mt5Platform = payload.platform ?? "mt5"
 
-  if (url) {
-    let res: Response
-    try {
-      res = await bridgeFetch("/connect", payload)
-    } catch (err: unknown) {
-      const isTimeout = err instanceof Error && err.name === "AbortError"
-      throw new Error(
-        isTimeout
-          ? "Le bridge MT5 ne répond pas (timeout). Vérifiez que start.bat est lancé sur le VPS."
-          : `Impossible de joindre le bridge MT5 : ${err instanceof Error ? err.message : String(err)}`
-      )
+  if (!login || !payload.password || !server) {
+    throw new Error("Identifiants MT4/MT5 incomplets.")
+  }
+  if (!/^\d+$/.test(login)) {
+    throw new Error("Le login MT4/MT5 doit être numérique.")
+  }
+  if (!isMetaApiConfigured()) {
+    throw new Error("MetaApi n'est pas configuré (METAAPI_TOKEN manquant).")
+  }
+
+  const api = getMetaApi()
+
+  // Créer le compte MetaApi
+  let account: MetatraderAccount
+  try {
+    account = await api.metatraderAccountApi.createAccount({
+      name: `ANCIENFX ${login}`,
+      type: "cloud-g2",
+      login,
+      password: payload.password,
+      server,
+      platform,
+      magic: 0,
+      application: APPLICATION,
+      region: DEFAULT_REGION,
+      keywords: [],
+      quoteStreamingIntervalInSeconds: 2.5,
+      reliability: "regular",
+      // Rôle SUBSCRIBER : permet de recevoir les trades copiés depuis le compte maître via CopyFactory.
+      copyFactoryRoles: ["SUBSCRIBER"],
+      metadata: { app: "ancienfx" },
+    })
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    throw new Error(`Impossible de créer le compte chez MetaApi : ${msg}`)
+  }
+
+  // Déployer + attendre la connexion broker ; nettoyer si échec
+  try {
+    const connection = await getSyncedConnection(account)
+    const info = await connection.getAccountInformation()
+    const dailyProfit = await computeDailyProfit(connection)
+
+    return {
+      metaApiAccountId: account.id,
+      login: String(info.login ?? login),
+      server: info.server ?? server,
+      broker: info.broker ?? "",
+      accountType: isDemoAccountType(info.type) ? "DEMO" : "RÉEL",
+      leverage: Number(info.leverage ?? 0),
+      isDemo: isDemoAccountType(info.type),
+      balance: Math.round(Number(info.balance ?? 0) * 100) / 100,
+      equity: Math.round(Number(info.equity ?? 0) * 100) / 100,
+      freeMargin: Math.round(Number(info.freeMargin ?? 0) * 100) / 100,
+      dailyProfit,
+      currency: info.currency ?? "USD",
     }
-
-    const data = await res.json()
-    if (!res.ok || !data.ok) {
-      throw new Error(data.message || "Connexion MT5 impossible.")
-    }
-    return data.account as Mt5AccountInfo
+  } catch (err) {
+    // Compte non fonctionnel → suppression pour économiser les ressources MetaApi
+    await safeRemove(account)
+    const isTimeout = err instanceof Error && /timeout/i.test(err.message)
+    throw new Error(
+      isTimeout
+        ? "Connexion au broker impossible (identifiants ou serveur incorrects). Le compte a été retiré."
+        : `Connexion MT4/MT5 impossible : ${err instanceof Error ? err.message : String(err)}`,
+    )
   }
-
-  // Dev fallback — aucun bridge disponible
-  if (!payload.login || !payload.password || !payload.server) {
-    throw new Error("Identifiants MT5 incomplets.")
-  }
-  if (payload.password.length < 4) {
-    throw new Error("Mot de passe MT5 invalide.")
-  }
-  return mockAccount(payload)
 }
 
 /**
- * Rafraîchit les données d'un compte MT5 existant.
- * Retourne null si le bridge est absent ou si la session a expiré.
+ * Rafraîchit les infos d'un compte MetaApi existant (par son id MetaApi).
+ * Retourne null si MetaApi n'est pas configuré ou si le compte est injoignable.
  */
-export async function syncMt5Account(login: string, server: string): Promise<Mt5AccountInfo | null> {
-  const url = bridgeUrl()
-  if (!url) return null
+export async function syncMt5Account(metaApiAccountId: string): Promise<Mt5AccountInfo | null> {
+  if (!isMetaApiConfigured() || !metaApiAccountId) return null
 
   try {
-    const res = await bridgeFetch("/sync", { login, server })
-    if (!res.ok) return null
-    const data = await res.json()
-    if (!data.ok) return null
-    return data.account as Mt5AccountInfo
-  } catch {
+    const api = getMetaApi()
+    const account = await api.metatraderAccountApi.getAccount(metaApiAccountId)
+    const connection = await getSyncedConnection(account)
+    const info = await connection.getAccountInformation()
+    const dailyProfit = await computeDailyProfit(connection)
+
+    return {
+      metaApiAccountId: account.id,
+      login: String(info.login ?? account.login ?? ""),
+      server: info.server ?? account.server ?? "",
+      broker: info.broker ?? "",
+      accountType: isDemoAccountType(info.type) ? "DEMO" : "RÉEL",
+      leverage: Number(info.leverage ?? 0),
+      isDemo: isDemoAccountType(info.type),
+      balance: Math.round(Number(info.balance ?? 0) * 100) / 100,
+      equity: Math.round(Number(info.equity ?? 0) * 100) / 100,
+      freeMargin: Math.round(Number(info.freeMargin ?? 0) * 100) / 100,
+      dailyProfit,
+      currency: info.currency ?? "USD",
+    }
+  } catch (err) {
+    console.error("[v0] syncMt5Account error:", err instanceof Error ? err.message : err)
     return null
   }
 }
 
 /**
- * Supprime la session MT5 du bridge (ne déconnecte pas MT5 globalement).
+ * Déconnecte un compte MetaApi.
+ * - Par défaut supprime le compte (remove) pour libérer toutes les ressources.
+ * - Passez { keep: true } pour seulement le mettre hors ligne (undeploy).
  */
-export async function disconnectMt5Account(login: string, server: string): Promise<void> {
-  const url = bridgeUrl()
-  if (!url) return
+export async function disconnectMt5Account(
+  metaApiAccountId: string,
+  options: { keep?: boolean } = {},
+): Promise<void> {
+  if (!isMetaApiConfigured() || !metaApiAccountId) return
 
   try {
-    await bridgeFetch("/disconnect", { login, server })
-  } catch {
-    // On ignore les erreurs de déconnexion (ex: bridge éteint)
+    const api = getMetaApi()
+    const account = await api.metatraderAccountApi.getAccount(metaApiAccountId)
+    if (options.keep) {
+      await account.undeploy()
+    } else {
+      await account.remove()
+    }
+  } catch (err) {
+    console.error("[v0] disconnectMt5Account error:", err instanceof Error ? err.message : err)
   }
 }
 
 /**
- * Récupère les positions ouvertes du compte.
- * Retourne un tableau vide si le bridge est absent.
+ * Positions ouvertes d'un compte MetaApi. Tableau vide si indisponible.
  */
-export async function getMt5Positions(login: string, server: string): Promise<Mt5Position[]> {
-  const url = bridgeUrl()
-  if (!url) return []
+export async function getMt5Positions(metaApiAccountId: string): Promise<Mt5Position[]> {
+  if (!isMetaApiConfigured() || !metaApiAccountId) return []
 
   try {
-    const res = await bridgeFetch("/positions", { login, server })
-    if (!res.ok) return []
-    const data = await res.json()
-    return (data.positions ?? []) as Mt5Position[]
-  } catch {
+    const api = getMetaApi()
+    const account = await api.metatraderAccountApi.getAccount(metaApiAccountId)
+    const connection = await getSyncedConnection(account)
+    const positions = await connection.getPositions()
+
+    return positions.map((p) => ({
+      ticket: Number(p.id),
+      symbol: p.symbol,
+      type: toBuySell(p.type),
+      volume: Number(p.volume ?? 0),
+      openPrice: Number(p.openPrice ?? 0),
+      sl: Number(p.stopLoss ?? 0),
+      tp: Number(p.takeProfit ?? 0),
+      profit: Math.round(Number(p.profit ?? 0) * 100) / 100,
+      swap: Math.round(Number(p.swap ?? 0) * 100) / 100,
+      comment: p.comment ?? "",
+      openTime: p.time instanceof Date ? p.time.toISOString() : String(p.time ?? ""),
+    }))
+  } catch (err) {
+    console.error("[v0] getMt5Positions error:", err instanceof Error ? err.message : err)
     return []
   }
 }
 
 /**
- * Récupère l'historique des trades sur N jours (défaut : 30).
- * Retourne un tableau vide si le bridge est absent.
+ * Historique des trades clôturés sur N jours (défaut : 30). Tableau vide si indisponible.
  */
-export async function getMt5History(login: string, server: string, days = 30): Promise<Mt5Deal[]> {
-  const url = bridgeUrl()
-  if (!url) return []
+export async function getMt5History(metaApiAccountId: string, days = 30): Promise<Mt5Deal[]> {
+  if (!isMetaApiConfigured() || !metaApiAccountId) return []
 
   try {
-    const res = await bridgeFetch("/history", { login, server, days })
-    if (!res.ok) return []
-    const data = await res.json()
-    return (data.deals ?? []) as Mt5Deal[]
-  } catch {
+    const api = getMetaApi()
+    const account = await api.metatraderAccountApi.getAccount(metaApiAccountId)
+    const connection = await getSyncedConnection(account)
+
+    const start = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
+    const end = new Date()
+    const result = await connection.getDealsByTimeRange(start, end)
+    const deals = result?.deals ?? []
+
+    return deals
+      // On garde seulement les vrais deals de trading (achat/vente), pas les mouvements de solde
+      .filter((d) => /BUY|SELL/i.test(d.type) && d.symbol)
+      .map((d) => ({
+        ticket: Number(d.id),
+        symbol: d.symbol ?? "",
+        type: toBuySell(d.type),
+        volume: Number(d.volume ?? 0),
+        price: Number(d.price ?? 0),
+        profit: Math.round(Number(d.profit ?? 0) * 100) / 100,
+        commission: Math.round(Number(d.commission ?? 0) * 100) / 100,
+        swap: Math.round(Number(d.swap ?? 0) * 100) / 100,
+        comment: d.comment ?? "",
+        time: d.time instanceof Date ? d.time.toISOString() : String(d.time ?? ""),
+      }))
+  } catch (err) {
+    console.error("[v0] getMt5History error:", err instanceof Error ? err.message : err)
     return []
   }
 }
 
-// ── Copy trading (maître → slaves) ───────────────────────────────────────────
-
-export type CopyMode = "balance" | "multiplier" | "fixed"
-
-export type CopyStatus = {
-  enabled: boolean
-  master: { login: string; server: string; connected: boolean }
-  slavesCount: number
-  trackedMasterPositions: number
-  stats: { opens: number; closes: number; modifies: number; errors: number; lastCycle: number }
-  config: Record<string, unknown>
-}
-
-export type CopyConfigPatch = {
-  enabled?: boolean
-  masterLogin?: string
-  masterServer?: string
-  mode?: CopyMode
-  multiplier?: number
-  copySltp?: boolean
-  minVolume?: number
-  maxVolume?: number
-  magic?: number
-  pollInterval?: number
-  slaveOverrides?: Record<string, { mode?: CopyMode; multiplier?: number }>
-}
-
-function mapCopyStatus(data: Record<string, unknown>): CopyStatus {
-  const master = (data.master ?? {}) as Record<string, unknown>
-  const stats = (data.stats ?? {}) as Record<string, unknown>
-  return {
-    enabled: Boolean(data.enabled),
-    master: {
-      login: String(master.login ?? ""),
-      server: String(master.server ?? ""),
-      connected: Boolean(master.connected),
-    },
-    slavesCount: Number(data.slaves_count ?? 0),
-    trackedMasterPositions: Number(data.tracked_master_positions ?? 0),
-    stats: {
-      opens: Number(stats.opens ?? 0),
-      closes: Number(stats.closes ?? 0),
-      modifies: Number(stats.modifies ?? 0),
-      errors: Number(stats.errors ?? 0),
-      lastCycle: Number(stats.last_cycle ?? 0),
-    },
-    config: (data.config ?? {}) as Record<string, unknown>,
-  }
-}
-
-/** État courant du moteur de copie. Null si le bridge est absent. */
-export async function getCopyStatus(): Promise<CopyStatus | null> {
-  const url = bridgeUrl()
-  if (!url) return null
-  try {
-    const res = await bridgeFetch("/copy/status")
-    if (!res.ok) return null
-    const data = await res.json()
-    if (!data.ok) return null
-    return mapCopyStatus(data)
-  } catch {
-    return null
-  }
-}
-
-/** Met à jour la config du moteur de copie (camelCase → snake_case pour le bridge). */
-export async function updateCopyConfig(patch: CopyConfigPatch): Promise<CopyStatus | null> {
-  const url = bridgeUrl()
-  if (!url) return null
-  const body: Record<string, unknown> = {}
-  if (patch.enabled !== undefined) body.enabled = patch.enabled
-  if (patch.masterLogin !== undefined) body.master_login = patch.masterLogin
-  if (patch.masterServer !== undefined) body.master_server = patch.masterServer
-  if (patch.mode !== undefined) body.mode = patch.mode
-  if (patch.multiplier !== undefined) body.multiplier = patch.multiplier
-  if (patch.copySltp !== undefined) body.copy_sltp = patch.copySltp
-  if (patch.minVolume !== undefined) body.min_volume = patch.minVolume
-  if (patch.maxVolume !== undefined) body.max_volume = patch.maxVolume
-  if (patch.magic !== undefined) body.magic = patch.magic
-  if (patch.pollInterval !== undefined) body.poll_interval = patch.pollInterval
-  if (patch.slaveOverrides !== undefined) body.slave_overrides = patch.slaveOverrides
-
-  try {
-    const res = await bridgeFetch("/copy/config", body)
-    if (!res.ok) return null
-    const data = await res.json()
-    if (!data.ok) return null
-    return mapCopyStatus(data)
-  } catch {
-    return null
-  }
-}
-
-/** Active la copie, en définissant optionnellement le compte maître. */
-export async function enableCopy(master?: { login: string; server?: string }): Promise<CopyStatus | null> {
-  const url = bridgeUrl()
-  if (!url) return null
-  const body: Record<string, unknown> = {}
-  if (master?.login) body.master_login = master.login
-  if (master?.server) body.master_server = master.server
-  try {
-    const res = await bridgeFetch("/copy/enable", body)
-    if (!res.ok) return null
-    const data = await res.json()
-    if (!data.ok) return null
-    return mapCopyStatus(data)
-  } catch {
-    return null
-  }
-}
-
-/** Désactive la copie (les positions ouvertes restent en place). */
-export async function disableCopy(): Promise<CopyStatus | null> {
-  const url = bridgeUrl()
-  if (!url) return null
-  try {
-    const res = await bridgeFetch("/copy/disable", {})
-    if (!res.ok) return null
-    const data = await res.json()
-    if (!data.ok) return null
-    return mapCopyStatus(data)
-  } catch {
-    return null
-  }
-}
-
 /**
- * Résout un symbole avec suffixe automatique (EURUSDm → EURUSD, etc.)
- * Retourne null si le bridge est absent ou le symbole introuvable.
+ * Résout un symbole disponible chez le broker (gère les suffixes type EURUSDm).
+ * Retourne null si introuvable.
  */
 export async function resolveSymbol(
-  symbol: string
+  metaApiAccountId: string,
+  symbol: string,
 ): Promise<{ original: string; resolved: string } | null> {
-  const url = bridgeUrl()
-  if (!url) return null
+  if (!isMetaApiConfigured() || !metaApiAccountId) return null
 
   try {
-    const res = await bridgeFetch("/symbol_info", { symbol })
-    if (!res.ok) return null
-    const data = await res.json()
-    if (!data.ok) return null
-    return { original: data.original, resolved: data.resolved }
-  } catch {
+    const api = getMetaApi()
+    const account = await api.metatraderAccountApi.getAccount(metaApiAccountId)
+    const connection = await getSyncedConnection(account)
+    const symbols = await connection.getSymbols()
+
+    if (symbols.includes(symbol)) return { original: symbol, resolved: symbol }
+    const match = symbols.find((s) => s.toUpperCase().startsWith(symbol.toUpperCase()))
+    return match ? { original: symbol, resolved: match } : null
+  } catch (err) {
+    console.error("[v0] resolveSymbol error:", err instanceof Error ? err.message : err)
     return null
   }
 }
