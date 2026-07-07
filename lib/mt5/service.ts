@@ -13,8 +13,7 @@
  * Variable d'environnement requise : METAAPI_TOKEN
  */
 
-import type MetatraderAccount from "metaapi.cloud-sdk/dist/metaApi/metatraderAccount"
-import { getMetaApi, isMetaApiConfigured, DEFAULT_REGION, APPLICATION } from "./metaapi"
+import { getMetaApi, isMetaApiConfigured, DEFAULT_REGION, type MtAccount } from "./metaapi"
 
 // ── Types publics ──────────────────────────────────────────────────────────────
 
@@ -96,7 +95,7 @@ function isDemoAccountType(type: string | undefined): boolean {
 }
 
 /** Supprime un compte MetaApi sans jamais lever d'exception (nettoyage best-effort). */
-async function safeRemove(account: MetatraderAccount): Promise<void> {
+async function safeRemove(account: MtAccount): Promise<void> {
   try {
     await account.remove()
   } catch (err) {
@@ -109,7 +108,7 @@ async function safeRemove(account: MetatraderAccount): Promise<void> {
  * S'assure que le compte est déployé et connecté au broker.
  * Lève une erreur si le compte est introuvable ou injoignable.
  */
-async function getSyncedConnection(account: MetatraderAccount) {
+async function getSyncedConnection(account: MtAccount) {
   if (account.state !== "DEPLOYED") {
     await account.deploy()
   }
@@ -177,7 +176,7 @@ export async function connectMt5Account(payload: Mt5ConnectPayload): Promise<Mt5
   const api = getMetaApi()
 
   // Créer le compte MetaApi
-  let account: MetatraderAccount
+  let account: MtAccount
   try {
     account = await api.metatraderAccountApi.createAccount({
       name: `ANCIENFX ${login}`,
@@ -187,7 +186,6 @@ export async function connectMt5Account(payload: Mt5ConnectPayload): Promise<Mt5
       server,
       platform,
       magic: 0,
-      application: APPLICATION,
       region: DEFAULT_REGION,
       keywords: [],
       quoteStreamingIntervalInSeconds: 2.5,

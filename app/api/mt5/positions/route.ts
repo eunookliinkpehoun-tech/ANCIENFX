@@ -16,15 +16,15 @@ export async function GET() {
 
   try {
     const [rows] = await db.execute<RowDataPacket[]>(
-      "SELECT login, server FROM mt5_accounts WHERE user_id = ? AND status = 'connected' LIMIT 1",
+      "SELECT metaapi_account_id FROM mt5_accounts WHERE user_id = ? AND status = 'connected' LIMIT 1",
       [session.id],
     )
 
-    if (!rows[0]) {
+    if (!rows[0] || !rows[0].metaapi_account_id) {
       return NextResponse.json({ ok: false, message: "Aucun compte MT5 connecté." }, { status: 400 })
     }
 
-    const positions = await getMt5Positions(rows[0].login, rows[0].server)
+    const positions = await getMt5Positions(rows[0].metaapi_account_id)
     return NextResponse.json({ ok: true, positions })
   } catch (error) {
     console.error("mt5 positions error", error)

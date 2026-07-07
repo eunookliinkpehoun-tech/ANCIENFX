@@ -9,6 +9,8 @@ import {
   isTrialActive,
 } from "@/lib/dashboard"
 import { connectMt5Account } from "@/lib/mt5/service"
+import { subscribeAccount } from "@/lib/mt5/copyfactory"
+import { getMasterConfig } from "@/lib/settings"
 
 export async function POST(request: Request) {
   const session = await getSessionUser()
@@ -73,8 +75,8 @@ export async function POST(request: Request) {
       const [insertResult] = await connection.execute<ResultSetHeader>(
         `INSERT INTO mt5_accounts
          (user_id, login, server, broker, account_type, leverage, is_demo, status,
-          balance, equity, free_margin, daily_profit, currency, connected_at, last_sync_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?, NOW(), NOW())`,
+          balance, equity, free_margin, daily_profit, currency, metaapi_account_id, connected_at, last_sync_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
         [
           session.id,
           account.login,
@@ -88,6 +90,7 @@ export async function POST(request: Request) {
           account.freeMargin,
           account.dailyProfit,
           account.currency,
+          account.metaApiAccountId,
         ],
       )
 
@@ -115,6 +118,17 @@ export async function POST(request: Request) {
       throw error
     } finally {
       connection.release()
+    }
+
+    // Abonnement à la copie de trades du compte maître (si configuré).
+    // Best-effort : un échec ici ne bloque pas la connexion du compte utilisateur.
+    try {
+      const master = await getMasterConfig()
+      if (master?.strategyId) {
+        await subscribeAccount(account.metaApiAccountId, master.strategyId)
+      }
+    } catch (copyError) {
+      console.error("[v0] CopyFactory subscribe on connect failed:", copyError)
     }
 
     const state = await getDashboardState(session.id)

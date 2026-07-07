@@ -16,8 +16,7 @@
  * dans la table app_settings.
  */
 
-import type MetatraderAccount from "metaapi.cloud-sdk/dist/metaApi/metatraderAccount"
-import { getMetaApi, getCopyFactory, isMetaApiConfigured, DEFAULT_REGION, APPLICATION } from "./metaapi"
+import { getMetaApi, getCopyFactory, isMetaApiConfigured, DEFAULT_REGION, type MtAccount } from "./metaapi"
 import type { Mt5Platform } from "./service"
 
 const CONNECT_TIMEOUT_SECONDS = 90
@@ -55,14 +54,14 @@ export type MasterStatus = {
   subscribersCount: number
 }
 
-async function ensureDeployed(account: MetatraderAccount): Promise<void> {
+async function ensureDeployed(account: MtAccount): Promise<void> {
   if (account.state !== "DEPLOYED") {
     await account.deploy()
   }
   await account.waitConnected(CONNECT_TIMEOUT_SECONDS)
 }
 
-async function safeRemove(account: MetatraderAccount): Promise<void> {
+async function safeRemove(account: MtAccount): Promise<void> {
   try {
     await account.remove()
   } catch (err) {
@@ -91,7 +90,7 @@ export async function provisionMaster(payload: MasterProvisionPayload): Promise<
 
   const api = getMetaApi()
 
-  let account: MetatraderAccount
+  let account: MtAccount
   try {
     account = await api.metatraderAccountApi.createAccount({
       name: `ANCIENFX MASTER ${login}`,
@@ -101,7 +100,6 @@ export async function provisionMaster(payload: MasterProvisionPayload): Promise<
       server,
       platform,
       magic: 0,
-      application: APPLICATION,
       region: DEFAULT_REGION,
       keywords: [],
       quoteStreamingIntervalInSeconds: 2.5,

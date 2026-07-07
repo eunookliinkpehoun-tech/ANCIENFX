@@ -17,6 +17,13 @@ import MetaApi, { CopyFactory } from "metaapi.cloud-sdk"
 
 export const APPLICATION = "ANCIENFX"
 
+/**
+ * Type d'un compte MetaTrader tel que retourné par l'API installée.
+ * Dérivé de l'API pour rester aligné avec la résolution de module réelle
+ * (esm-web vs dist) et éviter les conflits de types.
+ */
+export type MtAccount = Awaited<ReturnType<MetaApi["metatraderAccountApi"]["getAccount"]>>
+
 /** Région par défaut où sont déployés les comptes (économise les ressources en centralisant). */
 export const DEFAULT_REGION = process.env.METAAPI_REGION || "new-york"
 

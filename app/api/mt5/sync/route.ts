@@ -16,16 +16,15 @@ export async function POST() {
 
   try {
     const [rows] = await db.execute<RowDataPacket[]>(
-      "SELECT login, server FROM mt5_accounts WHERE user_id = ? AND status = 'connected' LIMIT 1",
+      "SELECT metaapi_account_id FROM mt5_accounts WHERE user_id = ? AND status = 'connected' LIMIT 1",
       [session.id],
     )
 
-    if (!rows[0]) {
+    if (!rows[0] || !rows[0].metaapi_account_id) {
       return NextResponse.json({ ok: false, message: "Aucun compte MT5 connecté." }, { status: 400 })
     }
 
-    const { login, server } = rows[0]
-    const account = await syncMt5Account(login, server)
+    const account = await syncMt5Account(rows[0].metaapi_account_id)
 
     if (!account) {
       // Bridge absent ou session expirée — on retourne l'état actuel sans erreur fatale
