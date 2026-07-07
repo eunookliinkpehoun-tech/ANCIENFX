@@ -12,12 +12,13 @@ import {
   FileText,
   Menu,
   X,
+  ShieldCheck,
 } from "lucide-react"
 import { dashBaseStyles, dashDashboardStyles } from "@/lib/dash-styles"
 import { FxMirrorLogo } from "@/components/fxmirror-logo"
 import { DASHBOARD_STATE_EVENT } from "@/components/dashboard/dashboard-context"
 
-export type DashPage = "dashboard" | "historique" | "parrainage" | "parametres"
+export type DashPage = "dashboard" | "historique" | "parrainage" | "parametres" | "admin"
 type ToastKind = "success" | "error" | "warning"
 
 const DashContext = createContext<{
@@ -45,6 +46,7 @@ function pageFromPath(path: string): DashPage {
   if (path.startsWith("/historique")) return "historique"
   if (path.startsWith("/parrainage")) return "parrainage"
   if (path.startsWith("/parametres")) return "parametres"
+  if (path.startsWith("/admin")) return "admin"
   return "dashboard"
 }
 
@@ -59,6 +61,7 @@ export function AppShell({
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [toast, setToast] = useState<{ kind: ToastKind; message: string } | null>(null)
   const [userName, setUserName] = useState("Utilisateur")
+  const [isAdmin, setIsAdmin] = useState(false)
   const [mt5Connected, setMt5Connected] = useState(false)
   const pathname = usePathname()
   const active = pageFromPath(pathname)
@@ -75,6 +78,7 @@ export function AppShell({
       .then((r) => r.json())
       .then((data) => {
         if (data.ok && data.user?.name) setUserName(data.user.name)
+        if (data.ok && data.user?.isAdmin) setIsAdmin(true)
       })
       .catch(() => {})
 
@@ -195,7 +199,13 @@ export function AppShell({
               </div>
             </div>
             <ul className="dash-nav-list">
-              {navItems.map(({ id, href, label, icon: Icon }) => (
+              {(isAdmin
+                ? [
+                    ...navItems,
+                    { id: "admin" as DashPage, href: "/admin", label: "Admin", icon: ShieldCheck },
+                  ]
+                : navItems
+              ).map(({ id, href, label, icon: Icon }) => (
                 <li key={id}>
                   <Link
                     href={href}

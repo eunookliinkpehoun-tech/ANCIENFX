@@ -665,6 +665,7 @@ export const dashDashboardStyles = `
     padding: 12px 14px; border-radius: 12px; border: 1px solid var(--d-line);
     background: var(--d-glass-2); color: var(--d-text); font-family: inherit; font-size: .95rem;
   }
+  .mt5-modal-hint { font-size: .8rem; color: var(--d-muted); background: var(--d-glass-2); border: 1px solid var(--d-line); border-radius: 10px; padding: 10px 12px; line-height: 1.5; }
   .mt5-modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 8px; }
   @media (max-width: 720px) {
     .mt5-modal-scrim { padding: 0; place-items: center; }
